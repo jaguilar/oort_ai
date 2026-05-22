@@ -5,6 +5,3 @@ edition = "2024"
 
 [dependencies]
 oort_api = "0.84.0"
-oort_simulator = { path = "/home/jaguilar/projects/oort3/shared/simulator" }
-oort_compiler = { path = "/home/jaguilar/projects/oort3/shared/compiler" }
-
