@@ -6,4 +6,4 @@ pub mod TUTORIAL_LEAD;
 pub mod TUTORIAL_RADAR;
 pub mod TUTORIAL_SEARCH;
 pub mod TUTORIAL_RADIO;
-
+pub mod TUTORIAL_MISSILE;
