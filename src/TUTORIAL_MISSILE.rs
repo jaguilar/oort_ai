@@ -1,15 +1,19 @@
 use oort_api::prelude::*;
-use crate::control::{quick_turn_with_target_omega, AngleTracker};
+use crate::control::{quick_turn_with_target_omega, AngleTracker, MissileGuidance};
 use crate::radar::RadarController;
 
 pub struct Ship {
     radar_controller: RadarController,
     angle_tracker: AngleTracker,
+    missile_guidance: MissileGuidance,
 }
 
 impl Ship {
     pub fn new() -> Ship {
         let rc = RadarController::new();
+        let mut mg = MissileGuidance::new();
+        // Since TUTORIAL_MISSILE uses channel 0 for fighter-to-missile target communication
+        mg.target_channel = 0;
 
         // Initialize radio for both fighter and missile
         select_radio(0);
@@ -18,64 +22,13 @@ impl Ship {
         Ship {
             radar_controller: rc,
             angle_tracker: AngleTracker::new(5.0),
+            missile_guidance: mg,
         }
     }
 
     pub fn tick(&mut self) {
         if class() == Class::Missile {
-            // Missile behavior
-            select_radio(0);
-            set_radio_channel(0);
-
-            if let Some(msg) = receive() {
-                let target_pos = vec2(msg[0], msg[1]);
-                let target_vel = vec2(msg[2], msg[3]);
-
-                let r = target_pos - position();
-                let r_len = r.length();
-                let v_rel = target_vel - velocity();
-
-                // 1. Self-destruct proximity check: detonate if within 20m or will be within 2 ticks
-                let next_r = r + v_rel * (2.0 * TICK_LENGTH);
-                if r_len < 20.0 || next_r.length() < 20.0 {
-                    explode();
-                    return;
-                }
-
-                // 2. Proportional Navigation Guidance
-
-                // Line-of-sight angular rate (cross product / r^2)
-                let numerator = r.x * v_rel.y - r.y * v_rel.x;
-                let denominator = r.dot(r);
-                let los_rate = if denominator > 1e-6 { numerator / denominator } else { 0.0 };
-
-                // Closing velocity
-                let v_c = -v_rel.dot(r) / r_len;
-
-                // Lateral acceleration command perpendicular to LOS in the direction of rotation
-                let e_perp = vec2(-r.y, r.x) / r_len;
-                let n = 4.0;
-                let a_lateral = n * v_c.max(100.0) * los_rate * e_perp;
-
-                // Forward acceleration towards the target
-                let dir = if r_len > 1e-6 {
-                    r / r_len
-                } else {
-                    vec2(heading().cos(), heading().sin())
-                };
-                let a_total = a_lateral + dir * max_forward_acceleration();
-
-                // Rotate ship to face the commanded acceleration vector to maximize thrust efficiency.
-                // Incorporate the angular velocity of the acceleration vector target.
-                let target_angle = a_total.angle();
-                let target_omega = self.angle_tracker.update(target_angle);
-                quick_turn_with_target_omega(target_angle, target_omega);
-
-                accelerate(a_total);
-
-                // Boost to reach target faster
-                activate_ability(Ability::Boost);
-            }
+            self.missile_guidance.tick();
         } else {
             // Fighter behavior
             self.radar_controller.update();

@@ -1,4 +1,5 @@
 use oort_api::prelude::*;
+use crate::radar::{RadarController, Contact};
 
 /// Calculates the clamped torque required to turn toward the target angle, taking target angular velocity into account.
 pub fn quick_turn_torque_with_target_omega(target_angle: f64, target_omega: f64) -> f64 {
@@ -226,3 +227,390 @@ impl TargetTracker {
     }
 }
 
+/// Missile guidance system encapsulating radar scanning, target selection,
+/// proportional navigation, fuel economy, and terminal orientation control.
+pub struct MissileGuidance {
+    // Adjustable constant parameters
+    pub proximity_dist: f64,
+    pub proximity_ticks: f64,
+    pub pn_gain: f64,
+    pub pn_min_vc: f64,
+    pub target_lock_delay_ticks: u32,
+    pub fuel_economy_dv_threshold: f64,
+    pub min_search_fuel: f64,
+    pub turn_safety_buffer_ticks: f64,
+
+    // State
+    pub radar_controller: RadarController,
+    pub angle_tracker: AngleTracker,
+    pub initial_fuel: f64,
+    pub target_id: Option<u32>,
+    pub first_detection_tick: Option<u32>,
+    pub target_channel: usize,
+    pub radio_target_tracker: TargetTracker,
+}
+
+impl MissileGuidance {
+    pub fn new() -> Self {
+        // Initial setup for the missile's radar and radio
+        select_radio(0);
+        set_radio_channel(3);
+
+        if class() == Class::Missile {
+            select_radar(0);
+            set_radar_heading(heading());
+        }
+
+        Self {
+            proximity_dist: 20.0,
+            proximity_ticks: 5.0,
+            pn_gain: 4.0,
+            pn_min_vc: 100.0,
+            target_lock_delay_ticks: 22,
+            fuel_economy_dv_threshold: 500.0,
+            min_search_fuel: 500.0,
+            turn_safety_buffer_ticks: 1.0,
+
+            radar_controller: RadarController::new(),
+            angle_tracker: AngleTracker::new(5.0),
+            initial_fuel: fuel(),
+            target_id: None,
+            first_detection_tick: None,
+            target_channel: 3,
+            radio_target_tracker: TargetTracker::new(),
+        }
+    }
+
+    pub fn tick(&mut self) {
+        // 1. Listen on the target radio channel
+        select_radio(0);
+        set_radio_channel(self.target_channel);
+
+        let mut radio_ping = None;
+
+        // Try standard float message first ([f64; 4]: pos_x, pos_y, vel_x, vel_y)
+        if let Some(msg) = receive() {
+            let pos_x = msg[0];
+            let pos_y = msg[1];
+            let vel_x = msg[2];
+            let vel_y = msg[3];
+
+            // Mismatched byte representation when interpreted as f64 yields astronomical values or NaNs.
+            // Check that the numbers are finite and lie within reasonable limits to distinguish formats.
+            if pos_x.is_finite() && pos_y.is_finite() && vel_x.is_finite() && vel_y.is_finite()
+                && pos_x.abs() < 100_000.0 && pos_y.abs() < 100_000.0
+                && vel_x.abs() < 10_000.0 && vel_y.abs() < 10_000.0
+            {
+                let pos = vec2(pos_x, pos_y);
+                let vel = vec2(vel_x, vel_y);
+                self.radio_target_tracker.update(current_tick(), pos, vel);
+                let accel = self.radio_target_tracker.acceleration();
+                debug!("Decoded radio float ping on channel {}: pos=({:.1}, {:.1}) vel=({:.1}, {:.1})", self.target_channel, pos.x, pos.y, vel.x, vel.y);
+                radio_ping = Some((pos, vel, accel));
+            }
+        }
+
+        // Set current target as high priority in the radar controller
+        self.radar_controller.priority_targets = self.target_id.map(|id| vec![id]).unwrap_or_default();
+
+        // Update radar controller
+        self.radar_controller.update();
+
+        // 2. Insert/update target in radar contact database if received via radio
+        let mut radio_target_id = None;
+        if let Some((pos, vel, accel)) = radio_ping {
+            let mut has_good_lock = false;
+            if let Some(tid) = self.target_id {
+                if let Some(contact) = self.radar_controller.contacts().iter().find(|c| c.id == tid) {
+                    if 3.89 * contact.pos_uncertainty <= 50.0 {
+                        has_good_lock = true;
+                    }
+                }
+            }
+
+            if !has_good_lock {
+                let contact_id = self.radar_controller.update_from_radio(pos, vel, accel, self.target_id);
+                radio_target_id = Some(contact_id);
+                self.target_id = Some(contact_id);
+            } else {
+                debug!("Ignoring radio telemetry: current target has a good lock (CI within 50m).");
+            }
+        }
+
+        let contacts = self.radar_controller.contacts();
+
+        // 3. Target selection
+        if radio_target_id.is_none() {
+            // A target is valid if it is still tracked in the contact list and is a Fighter
+            let target_still_valid = if let Some(id) = self.target_id {
+                contacts.iter().any(|c| c.id == id && c.class == Class::Fighter)
+            } else {
+                false
+            };
+
+            // Filter contacts to only target Class::Fighter
+            let fighters: Vec<&Contact> = contacts.iter()
+                .filter(|c| c.class == Class::Fighter)
+                .collect();
+
+            // Set the first detection tick if we've just detected a fighter
+            if !fighters.is_empty() && self.first_detection_tick.is_none() {
+                self.first_detection_tick = Some(current_tick());
+            }
+
+            if !target_still_valid {
+                // Delay target selection until we've had time for two full scans after first target detection
+                let can_lock = if let Some(first_tick) = self.first_detection_tick {
+                    current_tick() - first_tick >= self.target_lock_delay_ticks
+                } else {
+                    false
+                };
+
+                if can_lock && !fighters.is_empty() {
+                    // Pick a random fighter instead of the closest one
+                    let idx = (rand(0.0, fighters.len() as f64).floor() as usize).min(fighters.len() - 1);
+                    self.target_id = Some(fighters[idx].id);
+                } else {
+                    self.target_id = None;
+                }
+            }
+        }
+
+        if let Some(tid) = self.target_id {
+            if let Some(target) = contacts.iter().find(|c| c.id == tid) {
+                let target_pos = target.position;
+                let target_vel = target.velocity;
+                let target_class = target.class;
+
+                let r = target_pos - position();
+                let r_len = r.length();
+                let v_rel = target_vel - velocity();
+
+                // 1. Self-destruct proximity check: detonate if within target proximity or will be soon
+                let next_r = r + v_rel * (self.proximity_ticks * TICK_LENGTH);
+                if r_len < self.proximity_dist || next_r.length() < self.proximity_dist {
+                    explode();
+                    return;
+                }
+
+                // 2. Proportional Navigation Guidance
+                // Line-of-sight angular rate (cross product / r^2)
+                let numerator = r.x * v_rel.y - r.y * v_rel.x;
+                let denominator = r.dot(r);
+                let los_rate = if denominator > 1e-6 { numerator / denominator } else { 0.0 };
+
+                // Closing velocity
+                let v_c = -v_rel.dot(r) / r_len;
+
+                // Lateral acceleration command perpendicular to LOS in the direction of rotation
+                let e_perp = vec2(-r.y, r.x) / r_len;
+                let a_lateral = self.pn_gain * v_c.max(self.pn_min_vc) * los_rate * e_perp;
+
+                // Forward acceleration with fuel economy check
+                let dir = if r_len > 1e-6 {
+                    r / r_len
+                } else {
+                    vec2(heading().cos(), heading().sin())
+                };
+
+                let expended_fuel = self.initial_fuel - fuel();
+                let possible_enemy_dv = if v_c > 0.0 {
+                    let t_intercept = r_len / v_c;
+                    let base_dv = t_intercept * target_class.default_stats().max_forward_acceleration;
+                    let boost_dv = (t_intercept / 10.0).ceil() * 100.0;
+                    base_dv + boost_dv
+                } else {
+                    0.0
+                };
+
+                // Engages if we have expended at least threshold delta v and remaining fuel is low
+                let fuel_economy = expended_fuel >= self.fuel_economy_dv_threshold && fuel() < possible_enemy_dv;
+
+                let forward_acc = if fuel_economy {
+                    0.0
+                } else {
+                    max_forward_acceleration()
+                };
+
+                let a_total = a_lateral + dir * forward_acc;
+
+
+                // Turn to point directly at target intercept point when it's time to explode
+                let time_to_intercept = if v_c > 0.0 { r_len / v_c } else { f64::MAX };
+                let time_until_explosion = (time_to_intercept - self.proximity_ticks * TICK_LENGTH).max(0.0);
+
+                // Heading we need to face at the moment of explosion
+                let position_at_explosion = position() + time_until_explosion * velocity();
+                let target_pos_at_explosion = target_pos 
+                    + time_until_explosion * target_vel 
+                    + 0.5 * target.acceleration * time_until_explosion * (time_until_explosion + TICK_LENGTH);
+                let explode_heading = (target_pos_at_explosion - position_at_explosion).angle();
+
+                // Calculate how long we need to turn from the current heading to explode_heading
+                let diff = angle_diff(heading(), explode_heading);
+                let omega = angular_velocity();
+                let a = max_angular_acceleration().max(1.0);
+
+                let time_to_stop = if omega * diff < 0.0 { omega.abs() / a } else { 0.0 };
+                let angle_to_stop = 0.5 * omega.powi(2) / a;
+                let remaining_angle = (diff.abs() + if omega * diff < 0.0 { angle_to_stop } else { -angle_to_stop }).max(0.0);
+                let time_remaining_turn = 2.0 * (remaining_angle / a).sqrt();
+                let turn_time = time_to_stop + time_remaining_turn;
+
+                // Add a small safety buffer to ensure we finish the turn in time
+                let safety_buffer = self.turn_safety_buffer_ticks * TICK_LENGTH;
+                let turn_time_with_buffer = turn_time + safety_buffer;
+
+                let torque_cmd = if time_until_explosion <= turn_time_with_buffer {
+                    optimal_turn_torque(position(), velocity(), target_pos_at_explosion, None)
+                } else {
+                    let target_pos_aim = position() + a_total;
+                    optimal_turn_torque(position(), velocity(), target_pos_aim, Some(velocity()))
+                };
+                torque(torque_cmd);
+
+                accelerate(a_total);
+
+                // Print guidance mode and acceleration components
+                let is_terminal = time_until_explosion <= turn_time_with_buffer;
+                let mode = if is_terminal {
+                    "Terminal Turn"
+                } else if fuel_economy {
+                    "Fuel Economy"
+                } else {
+                    "Standard PN Guidance"
+                };
+                debug!("Mode: {}", mode);
+                debug!("Acc X: {:.2}", a_total.x);
+                debug!("Acc Y: {:.2}", a_total.y);
+                debug!("Lat Acc X: {:.2}, Y: {:.2}", a_lateral.x, a_lateral.y);
+                debug!("Fwd Acc X: {:.2}, Y: {:.2}", (dir * forward_acc).x, (dir * forward_acc).y);
+
+                // Boost to reach target faster, but only if not in fuel economy mode
+                if !fuel_economy {
+                    activate_ability(Ability::Boost);
+                }
+
+                // Draw projected intercept point of the currently selected target
+                if v_c > 0.0 {
+                    let intercept_point = target_pos 
+                        + time_to_intercept * target_vel 
+                        + 0.5 * target.acceleration * time_to_intercept * (time_to_intercept + TICK_LENGTH);
+                    draw_diamond(intercept_point, 16.0, rgb(255, 0, 0));
+                    draw_line(position(), intercept_point, rgb(255, 0, 0));
+                    draw_text!(intercept_point + vec2(0.0, 20.0), rgb(255, 0, 0), "Intercept: {:.2}s", time_to_intercept);
+                }
+
+                // Draw the current position of the currently selected target
+                draw_square(target_pos, 20.0, rgb(255, 0, 0));
+            }
+        } else {
+            // No target - burn straight ahead at maximum speed until we find a lock, provided we retain fuel
+            let (mode, a_cmd) = if fuel() >= self.min_search_fuel {
+                let heading_dir = vec2(heading().cos(), heading().sin());
+                ("Search Mode", heading_dir * max_forward_acceleration())
+            } else {
+                ("Coast Mode", vec2(0.0, 0.0))
+            };
+            debug!("Mode: {}", mode);
+            debug!("Acc X: {:.2}", a_cmd.x);
+            debug!("Acc Y: {:.2}", a_cmd.y);
+
+            accelerate(a_cmd);
+            if mode == "Search Mode" {
+                activate_ability(Ability::Boost);
+            } else {
+                deactivate_ability(Ability::Boost);
+            }
+        }
+    }
+}
+
+/// Computes the optimal constant-acceleration vector to intercept a target,
+/// given our position and velocity, and the target's position, velocity, and acceleration.
+pub fn optimal_intercept_acceleration(
+    our_pos: Vec2,
+    our_vel: Vec2,
+    target_pos: Vec2,
+    target_vel: Vec2,
+    target_accel: Vec2,
+    max_accel: f64,
+) -> Option<Vec2> {
+    let x = target_pos - our_pos;
+    let v_rel = target_vel - our_vel;
+
+    // We want to solve for time-to-impact T > 0 in:
+    // |2x/T^2 + 2v_rel/T + target_accel|^2 = max_accel^2
+    // Which is f(T) = |P(T)|^2 - max_accel^2 * T^4 = 0
+    // where P(T) = 2x + 2v_rel*T + target_accel*T^2
+    let dist = x.length();
+    let rel_speed = v_rel.length();
+    let mut t = if rel_speed > 1.0 {
+        dist / rel_speed
+    } else {
+        (2.0 * dist / max_accel).sqrt()
+    };
+    t = t.max(0.01);
+
+    let f = |t: f64| {
+        let p = 2.0 * x + 2.0 * v_rel * t + target_accel * t * t;
+        p.dot(p) - max_accel.powi(2) * t.powi(4)
+    };
+
+    let df = |t: f64| {
+        let p = 2.0 * x + 2.0 * v_rel * t + target_accel * t * t;
+        let p_prime = 2.0 * v_rel + 2.0 * target_accel * t;
+        2.0 * p.dot(p_prime) - 4.0 * max_accel.powi(2) * t.powi(3)
+    };
+
+    let clamp = |t: f64| t.max(0.001);
+
+    if let Some(time_to_impact) = newton_solve(t, f, df, clamp, 30, 1e-4) {
+        if time_to_impact > 0.0 {
+            let u = (2.0 * x) / (time_to_impact * time_to_impact) + (2.0 * v_rel) / time_to_impact + target_accel;
+            if u.length() > 0.0 {
+                return Some(u.normalize() * max_accel);
+            }
+        }
+    }
+    None
+}
+
+/// Calculates the optimal direct angular acceleration (torque) required to turn to face a target point
+/// in the minimum amount of time, taking into account target and self velocities to compute the
+/// exact relative angular velocity (line-of-sight rate) with zero lag.
+pub fn optimal_turn_torque(
+    our_pos: Vec2,
+    our_vel: Vec2,
+    target_pos: Vec2,
+    target_vel: Option<Vec2>,
+) -> f64 {
+    let r = target_pos - our_pos;
+    let v_rel = target_vel.unwrap_or(Vec2::new(0.0, 0.0)) - our_vel;
+    let target_angle = r.angle();
+    let r_len_sq = r.dot(r);
+    let target_omega = if r_len_sq > 1e-6 {
+        (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
+    } else {
+        0.0
+    };
+
+    let difference = angle_diff(heading(), target_angle);
+    let omega = angular_velocity();
+    let max_ang_accel = max_angular_acceleration();
+
+    let a_dec = max_ang_accel * 0.98;
+    let k_p = 10.0;
+    let theta_trans = a_dec / (k_p * k_p);
+    let theta_offset = theta_trans / 2.0;
+
+    let omega_target_static = if difference.abs() <= theta_trans {
+        k_p * difference
+    } else {
+        difference.signum() * (2.0 * a_dec * (difference.abs() - theta_offset)).sqrt()
+    };
+
+    let omega_target = omega_target_static + target_omega;
+    let alpha_req = (omega_target - omega) / TICK_LENGTH;
+    alpha_req.clamp(-max_ang_accel, max_ang_accel)
+}
