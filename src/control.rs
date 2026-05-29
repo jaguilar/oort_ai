@@ -88,7 +88,13 @@ pub fn predict_lead(
     target_accel: Vec2,
 ) -> Option<(f64, Vec2)> {
     let dp0 = target_pos - our_pos;
-    let t0 = dp0.length() / bullet_speed;
+    let r_len = dp0.length();
+    if r_len < 1e-6 {
+        return None;
+    }
+    let dv = target_vel - our_vel;
+    let v_c = -dv.dot(dp0) / r_len;
+    let t0 = r_len / (bullet_speed + v_c.max(0.0));
     
     let f = |t: f64| {
         let p_e = target_pos + t * target_vel + 0.5 * target_accel * t * (t + TICK_LENGTH);
