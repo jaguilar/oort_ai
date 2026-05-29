@@ -12,7 +12,7 @@ impl Ship {
     pub fn new() -> Ship {
         let rc = RadarController::new();
         let mut mg = MissileGuidance::new();
-        // Since TUTORIAL_MISSILE uses channel 0 for fighter-to-missile target communication
+        // Since tutorial_missile uses channel 0 for fighter-to-missile target communication
         mg.target_channel = 0;
 
         // Initialize radio for both fighter and missile
