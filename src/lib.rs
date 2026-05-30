@@ -9,3 +9,6 @@ pub mod tutorial_radio;
 pub mod tutorial_missile;
 pub mod tutorial_squadron;
 pub mod tutorial_frigate;
+pub mod tutorial_cruiser;
+pub mod mission_gunnery;
+

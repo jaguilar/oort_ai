@@ -1,6 +1,6 @@
 use oort_api::prelude::*;
 use crate::control::{predict_lead, quick_turn_with_target_omega, AngleTracker};
-use crate::radar::RadarController;
+use crate::radar::{RadarController, DefaultScanSliceGenerator};
 
 pub struct Ship {
     radar_controller: RadarController,
@@ -20,12 +20,10 @@ impl Ship {
         let mut rc = RadarController::new();
         // Since the target is outside the default radar distance,
         // we use a narrower search beam width to increase SNR/range.
-        // Let's use 0.05 rad (approx. 2.8 degrees).
-        rc.set_search_width(0.05);
+        // Let's use 0.05 rad (approx. 2.8 degrees) and a max range of 100km.
+        rc.slice_generator = Box::new(DefaultScanSliceGenerator::new(0.05, 100000.0));
         // We also use a narrower tracking beam width for keeping locks at range.
         rc.set_tracking_width(0.02);
-        // Set the maximum radar distance to 100km to detect far-away targets.
-        rc.set_max_distance(100000.0);
         // Set the tracking gate radius (uncertainty/clipping window) to 200m.
         rc.set_gate_radius(200.0);
 

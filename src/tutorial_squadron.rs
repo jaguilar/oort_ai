@@ -29,8 +29,8 @@ impl Ship {
 
             debug!("--- POINT DEFENSE CANDIDATES ---");
             for c in contacts.iter().filter(|c| c.class == Class::Missile) {
-                let r = c.position - position();
-                let v_rel = c.velocity - velocity();
+                let r = c.current_position() - position();
+                let v_rel = c.current_velocity() - velocity();
                 let closing = r.dot(v_rel);
                 if closing < 0.0 {
                     const BULLET_SPEED: f64 = 1000.0;
@@ -38,12 +38,12 @@ impl Ship {
                         position(),
                         velocity(),
                         BULLET_SPEED,
-                        c.position,
-                        c.velocity,
+                        c.current_position(),
+                        c.current_velocity(),
                         c.acceleration,
                     ) {
-                        let p_e = c.position + time_to_impact * c.velocity + 0.5 * c.acceleration * time_to_impact * (time_to_impact + TICK_LENGTH);
-                        let dist_intercept_to_missile = p_e.distance(c.position);
+                        let p_e = c.position_at(current_tick() + (time_to_impact / TICK_LENGTH).round() as u32);
+                        let dist_intercept_to_missile = p_e.distance(c.current_position());
                         let dist_fighter_to_missile = r.length();
 
                         if dist_intercept_to_missile > dist_fighter_to_missile {
@@ -79,8 +79,8 @@ impl Ship {
                 let fighter_target = contacts.iter()
                     .filter(|c| c.class == Class::Fighter)
                     .min_by(|a, b| {
-                        let dist_a = position().distance(a.position);
-                        let dist_b = position().distance(b.position);
+                        let dist_a = position().distance(a.current_position());
+                        let dist_b = position().distance(b.current_position());
                         dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .cloned();
@@ -92,8 +92,8 @@ impl Ship {
                         position(),
                         velocity(),
                         BULLET_SPEED,
-                        target.position,
-                        target.velocity,
+                        target.current_position(),
+                        target.current_velocity(),
                         target.acceleration,
                     ) {
                         active_lead_dir = Some(lead_dir);
@@ -123,7 +123,7 @@ impl Ship {
                 }
                 if let Some(offset) = self.launch_offset {
                     if let Some(ref target) = active_target {
-                        let base_angle = (target.position - position()).angle();
+                        let base_angle = (target.current_position() - position()).angle();
                         let target_offset_angle = base_angle + offset;
                         if angle_diff(heading(), target_offset_angle).abs() < 4.0f64.to_radians() {
                             fire(1);
@@ -136,10 +136,10 @@ impl Ship {
             if let Some(target) = active_target {
                 let target_class_str = if target.class == Class::Missile { "MISSILE" } else { "FIGHTER" };
                 draw_text!(position() + vec2(0.0, 50.0), rgb(255, 0, 0), "TARGET LOCKED: {}", target_class_str);
-                draw_square(target.position, 40.0, rgb(255, 0, 0));
+                draw_square(target.current_position(), 40.0, rgb(255, 0, 0));
 
                 if let (Some(_lead_dir), Some(t_impact)) = (active_lead_dir, active_time_to_impact) {
-                    let p_lead = target.position + t_impact * target.velocity + 0.5 * target.acceleration * t_impact * (t_impact + TICK_LENGTH);
+                    let p_lead = target.position_at(current_tick() + (t_impact / TICK_LENGTH).round() as u32);
                     draw_square(p_lead, 16.0, rgb(255, 0, 0));
                     draw_line(position(), p_lead, rgb(255, 0, 0));
                     draw_text!(p_lead + vec2(0.0, -20.0), rgb(255, 0, 0), "CHOSEN Intercept: {:.3}s", t_impact);
@@ -148,7 +148,7 @@ impl Ship {
                 let mut target_angle = if let Some(lead_dir) = active_lead_dir {
                     lead_dir.angle()
                 } else {
-                    (target.position - position()).angle()
+                    (target.current_position() - position()).angle()
                 };
 
                 let true_lead_angle = target_angle;

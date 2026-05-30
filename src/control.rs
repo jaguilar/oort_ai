@@ -7,6 +7,17 @@ pub fn quick_turn_torque_with_target_omega(target_angle: f64, target_omega: f64)
     let omega = angular_velocity();
     let max_ang_accel = max_angular_acceleration();
     
+    let unaccelerated_next_heading = heading() + omega * TICK_LENGTH;
+    let diff_next = angle_diff(unaccelerated_next_heading, target_angle);
+    let speed_diff = (omega - target_omega).abs();
+    
+    if diff_next.abs() <= max_ang_accel * TICK_LENGTH * TICK_LENGTH
+        && speed_diff <= max_ang_accel * TICK_LENGTH
+    {
+        let alpha_req = diff_next / (TICK_LENGTH * TICK_LENGTH);
+        return alpha_req.clamp(-max_ang_accel, max_ang_accel);
+    }
+    
     // Safety buffer: use 98% of max angular acceleration to prevent any overshoot
     let a_dec = max_ang_accel * 0.98;
     let k_p = 10.0;
@@ -20,8 +31,19 @@ pub fn quick_turn_torque_with_target_omega(target_angle: f64, target_omega: f64)
         difference.signum() * (2.0 * a_dec * (difference.abs() - theta_offset)).sqrt()
     };
     
-    let omega_target = omega_target_static + target_omega;
-    let alpha_req = (omega_target - omega) / TICK_LENGTH;
+    let is_decelerating = difference * (omega - target_omega) > 0.0
+        && (omega - target_omega).abs() > omega_target_static.abs()
+        && difference.abs() > theta_trans;
+
+    let alpha_req = if is_decelerating {
+        let s = difference.signum();
+        let diff_adjusted = difference.abs() - theta_offset;
+        ( (target_omega - omega) - a_dec * s * TICK_LENGTH - s * (a_dec * (2.0 * diff_adjusted + a_dec * TICK_LENGTH * TICK_LENGTH)).sqrt() ) / TICK_LENGTH
+    } else {
+        let omega_target = omega_target_static + target_omega;
+        (omega_target - omega) / TICK_LENGTH
+    };
+    
     alpha_req.clamp(-max_ang_accel, max_ang_accel)
 }
 
@@ -123,7 +145,7 @@ pub fn predict_lead(
         }
     };
 
-    if let Some(t) = newton_solve(t0, f, df, clamp, 20, 1e-4) {
+    if let Some(t) = newton_solve(t0, f, df, clamp, 30, 1e-4) {
         if t >= 0.0 {
             let p_e = target_pos + t * target_vel + 0.5 * target_accel * t * (t + TICK_LENGTH);
             let d = p_e - our_pos - t * our_vel;
@@ -322,7 +344,7 @@ impl MissileGuidance {
             let mut has_good_lock = false;
             if let Some(tid) = self.target_id {
                 if let Some(contact) = self.radar_controller.contacts().iter().find(|c| c.id == tid) {
-                    if 3.89 * contact.pos_uncertainty <= 50.0 {
+                    if 3.89 * contact.current_pos_uncertainty() <= 50.0 {
                         has_good_lock = true;
                     }
                 }
@@ -331,6 +353,11 @@ impl MissileGuidance {
             if !has_good_lock {
                 let contact_id = self.radar_controller.update_from_radio(pos, vel, accel, self.target_id);
                 radio_target_id = Some(contact_id);
+                if let Some(old_id) = self.target_id {
+                    if old_id != contact_id {
+                        debug!("Ceasing targeting of target {} to lock onto radio target {} (reason: current target has poor lock or is lost)", old_id, contact_id);
+                    }
+                }
                 self.target_id = Some(contact_id);
             } else {
                 debug!("Ignoring radio telemetry: current target has a good lock (CI within 50m).");
@@ -369,8 +396,15 @@ impl MissileGuidance {
                 if can_lock && !fighters.is_empty() {
                     // Pick a random fighter instead of the closest one
                     let idx = (rand(0.0, fighters.len() as f64).floor() as usize).min(fighters.len() - 1);
-                    self.target_id = Some(fighters[idx].id);
+                    let new_id = fighters[idx].id;
+                    if let Some(old_id) = self.target_id {
+                        debug!("Ceasing targeting of target {} because it is no longer valid (not in contacts list or not a fighter); locking onto new target {}", old_id, new_id);
+                    }
+                    self.target_id = Some(new_id);
                 } else {
+                    if let Some(old_id) = self.target_id {
+                        debug!("Ceasing targeting of target {} because it is no longer valid (not in contacts list or not a fighter) and no new target lock could be acquired", old_id);
+                    }
                     self.target_id = None;
                 }
             }
@@ -378,8 +412,8 @@ impl MissileGuidance {
 
         if let Some(tid) = self.target_id {
             if let Some(target) = contacts.iter().find(|c| c.id == tid) {
-                let target_pos = target.position;
-                let target_vel = target.velocity;
+                let target_pos = target.current_position();
+                let target_vel = target.current_velocity();
                 let target_class = target.class;
 
                 let r = target_pos - position();
@@ -441,9 +475,7 @@ impl MissileGuidance {
 
                 // Heading we need to face at the moment of explosion
                 let position_at_explosion = position() + time_until_explosion * velocity();
-                let target_pos_at_explosion = target_pos 
-                    + time_until_explosion * target_vel 
-                    + 0.5 * target.acceleration * time_until_explosion * (time_until_explosion + TICK_LENGTH);
+                let target_pos_at_explosion = target.position_at(current_tick() + (time_until_explosion / TICK_LENGTH).round() as u32);
                 let explode_heading = (target_pos_at_explosion - position_at_explosion).angle();
 
                 // Calculate how long we need to turn from the current heading to explode_heading
@@ -493,9 +525,7 @@ impl MissileGuidance {
 
                 // Draw projected intercept point of the currently selected target
                 if v_c > 0.0 {
-                    let intercept_point = target_pos 
-                        + time_to_intercept * target_vel 
-                        + 0.5 * target.acceleration * time_to_intercept * (time_to_intercept + TICK_LENGTH);
+                    let intercept_point = target.position_at(current_tick() + (time_to_intercept / TICK_LENGTH).round() as u32);
                     draw_diamond(intercept_point, 16.0, rgb(255, 0, 0));
                     draw_line(position(), intercept_point, rgb(255, 0, 0));
                     draw_text!(intercept_point + vec2(0.0, 20.0), rgb(255, 0, 0), "Intercept: {:.2}s", time_to_intercept);
@@ -599,6 +629,17 @@ pub fn optimal_turn_torque(
     let omega = angular_velocity();
     let max_ang_accel = max_angular_acceleration();
 
+    let unaccelerated_next_heading = heading() + omega * TICK_LENGTH;
+    let diff_next = angle_diff(unaccelerated_next_heading, target_angle);
+    let speed_diff = (omega - target_omega).abs();
+
+    if diff_next.abs() <= max_ang_accel * TICK_LENGTH * TICK_LENGTH
+        && speed_diff <= max_ang_accel * TICK_LENGTH
+    {
+        let alpha_req = diff_next / (TICK_LENGTH * TICK_LENGTH);
+        return alpha_req.clamp(-max_ang_accel, max_ang_accel);
+    }
+
     let a_dec = max_ang_accel * 0.98;
     let k_p = 10.0;
     let theta_trans = a_dec / (k_p * k_p);
@@ -610,7 +651,70 @@ pub fn optimal_turn_torque(
         difference.signum() * (2.0 * a_dec * (difference.abs() - theta_offset)).sqrt()
     };
 
-    let omega_target = omega_target_static + target_omega;
-    let alpha_req = (omega_target - omega) / TICK_LENGTH;
+    let is_decelerating = difference * (omega - target_omega) > 0.0
+        && (omega - target_omega).abs() > omega_target_static.abs()
+        && difference.abs() > theta_trans;
+
+    let alpha_req = if is_decelerating {
+        let s = difference.signum();
+        let diff_adjusted = difference.abs() - theta_offset;
+        ( (target_omega - omega) - a_dec * s * TICK_LENGTH - s * (a_dec * (2.0 * diff_adjusted + a_dec * TICK_LENGTH * TICK_LENGTH)).sqrt() ) / TICK_LENGTH
+    } else {
+        let omega_target = omega_target_static + target_omega;
+        (omega_target - omega) / TICK_LENGTH
+    };
+    
     alpha_req.clamp(-max_ang_accel, max_ang_accel)
+}
+
+/// Estimates the time to complete a turn to face a target angle and match target angular velocity,
+/// assuming we use the quick_turn_torque_with_target_omega controller.
+pub fn quick_turn_time_with_target_omega(target_angle: f64, target_omega: f64) -> f64 {
+    let mut x0 = angle_diff(heading(), target_angle);
+    let mut v0 = angular_velocity() - target_omega;
+    let a = max_angular_acceleration();
+    if a < 1e-6 {
+        return f64::INFINITY;
+    }
+
+    let a_dec = a * 0.98;
+    let k_p = 10.0;
+    let theta_trans = a_dec / (k_p * k_p);
+    let theta_offset = theta_trans / 2.0;
+
+    // Check if we are already aligned and matched within the 1-tick control window
+    let unaccelerated_next_heading = heading() + angular_velocity() * TICK_LENGTH;
+    let diff_next = angle_diff(unaccelerated_next_heading, target_angle);
+    let speed_diff = (angular_velocity() - target_omega).abs();
+    if diff_next.abs() <= a * TICK_LENGTH * TICK_LENGTH
+        && speed_diff <= a * TICK_LENGTH
+    {
+        return 0.0;
+    }
+
+    if x0 < 0.0 {
+        x0 = -x0;
+        v0 = -v0;
+    }
+
+    // Scale the settling time dynamically based on the error size, up to a maximum of 3.0 / k_p
+    let x_start = x0 + v0.abs() / k_p;
+    let tol = 0.001; // tolerance in radians
+    let t_settle = if x_start > tol {
+        ((x_start / tol).ln() / k_p).min(3.0 / k_p)
+    } else {
+        0.0
+    };
+
+    if x0 <= theta_trans {
+        let v_target = -k_p * x0;
+        let t1 = (v0 - v_target).abs() / a;
+        t1 + t_settle
+    } else {
+        let d = (a_dec / (a + a_dec)) * v0 * v0 + (2.0 * a * a_dec / (a + a_dec)) * (x0 - theta_offset);
+        let d_sqrt = d.max(0.0).sqrt();
+        let t1 = ((v0 + d_sqrt) / a).max(0.0);
+        let t2 = ((d_sqrt - k_p * theta_trans) / a_dec).max(0.0);
+        t1 + t2 + t_settle
+    }
 }

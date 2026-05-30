@@ -4,6 +4,7 @@ use oort_api::prelude::*;
 pub struct Contact {
     pub id: u32,
     pub class: Class,
+    // The following fields represent the last ground truth measurement from a scan:
     pub position: Vec2,
     pub velocity: Vec2,
     pub acceleration: Vec2,
@@ -13,57 +14,141 @@ pub struct Contact {
     pub pos_uncertainty: f64,
     pub vel_uncertainty: f64,
     pub radar_locked: bool,
+    pub provisional: bool,
+    pub tracking_retry_count: u32,
+    pub confirmation_attempts: u32,
+    pub confusing_contact: Option<u32>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+impl Contact {
+    pub fn position_at(&self, tick: u32) -> Vec2 {
+        let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
+        self.position + self.velocity * dt + 0.5 * self.acceleration * dt * (dt + TICK_LENGTH)
+    }
+
+    pub fn velocity_at(&self, tick: u32) -> Vec2 {
+        let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
+        self.velocity + self.acceleration * dt
+    }
+
+    pub fn pos_uncertainty_at(&self, tick: u32) -> f64 {
+        let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
+        self.pos_uncertainty + self.vel_uncertainty * dt
+    }
+
+    pub fn current_position(&self) -> Vec2 {
+        self.position_at(current_tick())
+    }
+
+    pub fn current_velocity(&self) -> Vec2 {
+        self.velocity_at(current_tick())
+    }
+
+    pub fn current_pos_uncertainty(&self) -> f64 {
+        self.pos_uncertainty_at(current_tick())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RadarState {
     Scanning,
     Tracking { contact_id: u32 },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RadarJob {
+    pub angle: f64,
+    pub width: f64,
+    pub min_distance: f64,
+    pub max_distance: f64,
+    pub state: RadarState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScanSlice {
+    pub angle: f64,
+    pub width: f64,
+    pub min_distance: f64,
+    pub max_distance: f64,
+}
+
+pub trait ScanSliceGenerator {
+    fn next_slice(&mut self, target: Option<&Contact>) -> ScanSlice;
+}
+
+pub struct DefaultScanSliceGenerator {
+    pub search_width: f64,
+    pub max_distance: f64,
+    pub last_scan_heading: Option<f64>,
+}
+
+impl DefaultScanSliceGenerator {
+    pub fn new(search_width: f64, max_distance: f64) -> Self {
+        Self {
+            search_width,
+            max_distance,
+            last_scan_heading: None,
+        }
+    }
+}
+
+impl ScanSliceGenerator for DefaultScanSliceGenerator {
+    fn next_slice(&mut self, _target: Option<&Contact>) -> ScanSlice {
+        let last_angle = self.last_scan_heading.unwrap_or_else(|| radar_heading());
+        let sweep_head = last_angle + self.search_width;
+        self.last_scan_heading = Some(sweep_head);
+        ScanSlice {
+            angle: sweep_head,
+            width: self.search_width,
+            min_distance: 0.0,
+            max_distance: self.max_distance,
+        }
+    }
+}
+
 pub struct RadarController {
     contacts: Vec<Contact>,
+    non_provisional_contacts: Vec<Contact>,
     next_contact_id: u32,
-    active_radar_state: RadarState,
+    radar_states: Vec<RadarState>,
+    prev_slices: Vec<Option<ScanSlice>>,
     current_target_id: Option<u32>,
-    search_width: f64,
     tracking_width: f64,
-    max_distance: f64,
     gate_radius: f64,
     pub full_scans: u32,
     pub priority_targets: Vec<u32>,
+    pub priority_track_interval: u32,
     scan_ticks: u32,
     last_scan_heading: Option<f64>,
+    pub slice_generator: Box<dyn ScanSliceGenerator>,
 }
 
 impl RadarController {
     pub fn new() -> Self {
+        let search_width = 0.6;
+        let tracking_width = 0.05;
+        let max_distance = 10000.0;
+        let gate_radius = 200.0;
         Self {
             contacts: Vec::new(),
+            non_provisional_contacts: Vec::new(),
             next_contact_id: 0,
-            active_radar_state: RadarState::Scanning,
+            radar_states: vec![RadarState::Scanning; 2],
+            prev_slices: vec![None; 2],
             current_target_id: None,
-            search_width: 0.6,
-            tracking_width: 0.05,
-            max_distance: 10000.0,
-            gate_radius: 200.0,
+            tracking_width,
+            gate_radius,
             full_scans: 0,
             priority_targets: Vec::new(),
+            priority_track_interval: 6,
             scan_ticks: 0,
             last_scan_heading: None,
+            slice_generator: Box::new(DefaultScanSliceGenerator::new(search_width, max_distance)),
         }
-    }
-
-    pub fn set_search_width(&mut self, width: f64) {
-        self.search_width = width;
     }
 
     pub fn set_tracking_width(&mut self, width: f64) {
         self.tracking_width = width;
-    }
-
-    pub fn set_max_distance(&mut self, dist: f64) {
-        self.max_distance = dist;
     }
 
     pub fn set_gate_radius(&mut self, radius: f64) {
@@ -71,34 +156,63 @@ impl RadarController {
     }
 
     pub fn contacts(&self) -> &[Contact] {
-        &self.contacts
+        &self.non_provisional_contacts
     }
 
     pub fn geometric_center(&self, default_pos: Vec2) -> Vec2 {
-        if self.contacts.is_empty() {
+        if self.non_provisional_contacts.is_empty() {
             default_pos
         } else {
-            let sum = self.contacts.iter().fold(Vec2::new(0.0, 0.0), |acc, c| acc + c.position);
-            sum / self.contacts.len() as f64
+            let sum = self.non_provisional_contacts.iter().fold(Vec2::new(0.0, 0.0), |acc, c| acc + c.current_position());
+            sum / self.non_provisional_contacts.len() as f64
         }
     }
 
     pub fn update(&mut self) {
-        select_radar(0);
-        let scan_result = scan();
         let current_t = current_tick();
+        let num_radars = if class() == Class::Cruiser { 2 } else { 1 };
 
-        // 1. Process scan result depending on active_radar_state
-        if let Some(ref c) = scan_result {
-            match self.active_radar_state {
+        // 1. Process scan results from previous tick depending on radar_states
+        let mut scan_results = Vec::new();
+        for i in 0..num_radars {
+            select_radar(i);
+            if let Some(r) = scan() {
+                scan_results.push((i, r));
+            } else {
+                if let RadarState::Tracking { contact_id } = self.radar_states[i] {
+                    if let Some(contact) = self.contacts.iter().find(|co| co.id == contact_id) {
+                        let next_pos = contact.position_at(current_t + 1);
+                        let next_pos_uncertainty = contact.pos_uncertainty_at(current_t + 1);
+                        let gate_radius = (3.89 * next_pos_uncertainty).max(self.gate_radius);
+                        debug!("removed {}: pos=None expect=({:.1}, {:.1}) gate={:.1}", contact_id, next_pos.x, next_pos.y, gate_radius);
+                    }
+                    self.contacts.retain(|co| co.id != contact_id);
+                }
+            }
+        }
+
+        for (i, c) in scan_results {
+            select_radar(i);
+            match self.radar_states[i] {
                 RadarState::Scanning => {
                     let mut best_match: Option<&mut Contact> = None;
                     let mut best_dist = f64::MAX;
 
                     for contact in &mut self.contacts {
                         if contact.class == c.class {
-                            let dist = contact.position.distance(c.position);
-                            if dist < (3.89 * contact.pos_uncertainty).max(250.0) && dist < best_dist {
+                            let expected_pos = contact.current_position();
+                            let dist = expected_pos.distance(c.position);
+                            let stats = contact.class.default_stats();
+                            let mut max_acc = stats.max_forward_acceleration
+                                .max(stats.max_backward_acceleration)
+                                .max(stats.max_lateral_acceleration);
+                            if contact.class == Class::Fighter || contact.class == Class::Missile {
+                                max_acc += 100.0;
+                            }
+                            let dt_sec = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
+                            let fallback = 0.5 * max_acc * dt_sec * dt_sec;
+                            let gate_radius = (3.89 * contact.current_pos_uncertainty()).max(10.0) + fallback;
+                            if dist < gate_radius && dist < best_dist {
                                 best_dist = dist;
                                 best_match = Some(contact);
                             }
@@ -106,6 +220,20 @@ impl RadarController {
                     }
 
                     if let Some(contact) = best_match {
+                        let ci_radius = 3.89 * contact.current_pos_uncertainty();
+                        if best_dist > ci_radius.max(10.0) && best_dist > 20.0 {
+                            let stats = contact.class.default_stats();
+                            let mut max_acc = stats.max_forward_acceleration
+                                .max(stats.max_backward_acceleration)
+                                .max(stats.max_lateral_acceleration);
+                            if contact.class == Class::Fighter || contact.class == Class::Missile {
+                                max_acc += 100.0;
+                            }
+                            let dt_sec = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
+                            let fallback = 0.5 * max_acc * dt_sec * dt_sec;
+                            debug!("Scan hit for contact {} was outside 99.99% CI and moved position by {:.1}m (>20m), associated due to dynamic gating fallback ({:.1}m based on max accel {:.1}m/s^2 and dt={:.3}s)", contact.id, best_dist, fallback, max_acc, dt_sec);
+                        }
+
                         let dt = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
                         let error_factor = 10.0f64.powf(-c.snr / 10.0);
                         let dist = position().distance(c.position);
@@ -114,8 +242,7 @@ impl RadarController {
                         let pos_unc = sigma_r.max(dist * sigma_theta.min(radar_width() / 2.0));
 
                         if dt > 0.0 {
-                            let num_extrapolations = (current_t - contact.last_scanned) as i32 - 1;
-                            let last_scanned_vel = contact.velocity - (num_extrapolations.max(0) as f64) * contact.acceleration * TICK_LENGTH;
+                            let last_scanned_vel = contact.velocity;
                             let raw_accel = (c.velocity - last_scanned_vel) / dt;
                             let alpha = if 3.89 * pos_unc < 10.0 { 1.0 } else { 0.5 };
                             contact.acceleration = alpha * raw_accel + (1.0 - alpha) * contact.acceleration;
@@ -128,6 +255,7 @@ impl RadarController {
                         contact.pos_uncertainty = pos_unc;
                         contact.vel_uncertainty = 100.0 * error_factor;
                         contact.radar_locked = true;
+                        contact.tracking_retry_count = 0;
                     } else {
                         let error_factor = 10.0f64.powf(-c.snr / 10.0);
                         let dist = position().distance(c.position);
@@ -135,27 +263,73 @@ impl RadarController {
                         let sigma_theta = (10.0 * (TAU / 360.0)) * error_factor;
                         let pos_unc = sigma_r.max(dist * sigma_theta.min(radar_width() / 2.0));
                         let vel_unc = 100.0 * error_factor;
+
+                        let last_scanned = current_t;
+
                         self.contacts.push(Contact {
                             id: self.next_contact_id,
                             class: c.class,
                             position: c.position,
                             velocity: c.velocity,
                             acceleration: Vec2::new(0.0, 0.0),
-                            last_scanned: current_t,
+                            last_scanned,
                             rssi: c.rssi,
                             snr: c.snr,
                             pos_uncertainty: pos_unc,
                             vel_uncertainty: vel_unc,
                             radar_locked: true,
+                            provisional: true,
+                            tracking_retry_count: 0,
+                            confirmation_attempts: 0,
+                            confusing_contact: None,
                         });
                         self.next_contact_id += 1;
                     }
                 }
                 RadarState::Tracking { contact_id } => {
-                    let mut found = false;
-                    if let Some(contact) = self.contacts.iter_mut().find(|co| co.id == contact_id) {
-                        if contact.class == c.class && contact.position.distance(c.position) < (3.89 * contact.pos_uncertainty).max(250.0) {
-                            found = true;
+                    let mut best_match_id = None;
+                    let mut best_dist = f64::MAX;
+
+                    for contact in &self.contacts {
+                        if contact.class == c.class {
+                            let expected_pos = contact.current_position();
+                            let dist = expected_pos.distance(c.position);
+                            let ci_radius = 3.89 * contact.current_pos_uncertainty();
+                            let stats = contact.class.default_stats();
+                            let mut max_acc = stats.max_forward_acceleration
+                                .max(stats.max_backward_acceleration)
+                                .max(stats.max_lateral_acceleration);
+                            if contact.class == Class::Fighter || contact.class == Class::Missile {
+                                max_acc += 100.0;
+                            }
+                            let dt_sec = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
+                            let fallback = 0.5 * max_acc * dt_sec * dt_sec;
+                            let gate_radius = 1.5 * (ci_radius.max(10.0) + fallback);
+                            if dist < gate_radius && dist < best_dist {
+                                best_dist = dist;
+                                best_match_id = Some(contact.id);
+                            }
+                        }
+                    }
+
+                    if let Some(best_id) = best_match_id {
+                        {
+                            let contact = self.contacts.iter_mut().find(|co| co.id == best_id).unwrap();
+                            let ci_radius = 3.89 * contact.current_pos_uncertainty();
+                            let stats = contact.class.default_stats();
+                            let mut max_acc = stats.max_forward_acceleration
+                                .max(stats.max_backward_acceleration)
+                                .max(stats.max_lateral_acceleration);
+                            if contact.class == Class::Fighter || contact.class == Class::Missile {
+                                max_acc += 100.0;
+                            }
+                            let dt_sec = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
+                            let fallback = 0.5 * max_acc * dt_sec * dt_sec;
+
+                            if best_dist > ci_radius.max(10.0) && best_dist > 20.0 {
+                                debug!("Tracked scan hit associated to contact {} was outside 99.99% CI and moved position by {:.1}m (>20m), associated due to dynamic gating fallback ({:.1}m based on max accel {:.1}m/s^2 and dt={:.3}s)", contact.id, best_dist, fallback, max_acc, dt_sec);
+                            }
+
                             let dt = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
                             let error_factor = 10.0f64.powf(-c.snr / 10.0);
                             let dist = position().distance(c.position);
@@ -164,8 +338,7 @@ impl RadarController {
                             let pos_unc = sigma_r.max(dist * sigma_theta.min(radar_width() / 2.0));
 
                             if dt > 0.0 {
-                                let num_extrapolations = (current_t - contact.last_scanned) as i32 - 1;
-                                let last_scanned_vel = contact.velocity - (num_extrapolations.max(0) as f64) * contact.acceleration * TICK_LENGTH;
+                                let last_scanned_vel = contact.velocity;
                                 let raw_accel = (c.velocity - last_scanned_vel) / dt;
                                 let alpha = if 3.89 * pos_unc < 10.0 { 1.0 } else { 0.5 };
                                 contact.acceleration = alpha * raw_accel + (1.0 - alpha) * contact.acceleration;
@@ -178,126 +351,340 @@ impl RadarController {
                             contact.pos_uncertainty = pos_unc;
                             contact.vel_uncertainty = 100.0 * error_factor;
                             contact.radar_locked = true;
+                            contact.tracking_retry_count = 0;
+                        }
+
+                        // Check if the new position is definitely distinct from all existing lower-numbered contacts.
+                        let mut is_distinct = true;
+                        for other in &self.contacts {
+                            if other.id < best_id {
+                                let d = other.current_position().distance(c.position);
+                                if d <= 30.0 {
+                                    is_distinct = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        let mut drop_this_contact = false;
+                        {
+                            let contact = self.contacts.iter_mut().find(|co| co.id == best_id).unwrap();
+                            if contact.provisional {
+                                contact.confirmation_attempts += 1;
+                                if is_distinct {
+                                    contact.provisional = false;
+                                    debug!("Confirmed contact {} because it is definitely distinct from lower-numbered contacts (>30m)", best_id);
+                                } else {
+                                    debug!("Contact {} remains unconfirmed (distance to a lower-numbered contact is <= 30m)", best_id);
+                                }
+                            }
+                            
+                            // Reset confusing_contact since we matched successfully
+                            contact.confusing_contact = None;
+
+                            if contact.provisional && contact.confirmation_attempts >= 3 {
+                                debug!("Dropping contact {} because it could not be confirmed after 3 tracking attempts", best_id);
+                                drop_this_contact = true;
+                            }
+                        }
+
+                        if drop_this_contact {
+                            self.contacts.retain(|other| other.id != best_id);
+                        } else {
+                            // Check duplicate dropping logic for best_id
+                            let mut min_dist_lower_id: Option<f64> = None;
+                            for other in &self.contacts {
+                                if other.id < best_id {
+                                    let d = other.current_position().distance(c.position);
+                                    if min_dist_lower_id.is_none() || Some(d) < min_dist_lower_id {
+                                        min_dist_lower_id = Some(d);
+                                    }
+                                }
+                            }
+                            if let Some(d) = min_dist_lower_id {
+                                debug!("Tracked contact {} distance to closest lower ID contact: {:.1}m", best_id, d);
+                            }
+
+                            let mut should_drop_self = false;
+                            self.contacts.retain(|other| {
+                                if other.id == best_id {
+                                    return true;
+                                }
+                                let d = other.current_position().distance(c.position);
+                                if d < 15.0 {
+                                    if other.id > best_id {
+                                        debug!("Dropping duplicate contact {} (higher ID) at distance {:.1}m from tracked contact {}", other.id, d, best_id);
+                                        return false;
+                                    } else {
+                                        should_drop_self = true;
+                                    }
+                                }
+                                true
+                            });
+
+                            if should_drop_self {
+                                debug!("Dropping tracked contact {} (higher ID) because it is within 15m of contact with lower ID", best_id);
+                                self.contacts.retain(|other| other.id != best_id);
+                            }
+                        }
+                    } else {
+                        // Create a new contact
+                        let error_factor = 10.0f64.powf(-c.snr / 10.0);
+                        let dist = position().distance(c.position);
+                        let sigma_r = 10000.0 * error_factor;
+                        let sigma_theta = (10.0 * (TAU / 360.0)) * error_factor;
+                        let pos_unc = sigma_r.max(dist * sigma_theta.min(radar_width() / 2.0));
+                        let vel_unc = 100.0 * error_factor;
+                        let last_scanned = current_t;
+
+                        self.contacts.push(Contact {
+                            id: self.next_contact_id,
+                            class: c.class,
+                            position: c.position,
+                            velocity: c.velocity,
+                            acceleration: Vec2::new(0.0, 0.0),
+                            last_scanned,
+                            rssi: c.rssi,
+                            snr: c.snr,
+                            pos_uncertainty: pos_unc,
+                            vel_uncertainty: vel_unc,
+                            radar_locked: true,
+                            provisional: true,
+                            tracking_retry_count: 0,
+                            confirmation_attempts: 0,
+                            confusing_contact: None,
+                        });
+                        self.next_contact_id += 1;
+                    }
+
+                    if best_match_id != Some(contact_id) {
+                        if let Some(intended_contact) = self.contacts.iter_mut().find(|co| co.id == contact_id) {
+                            intended_contact.tracking_retry_count += 1;
+                            let confusing_id = best_match_id.unwrap_or(self.next_contact_id - 1);
+                            intended_contact.confusing_contact = Some(confusing_id);
+                            debug!(
+                                "Tracked contact {} was not matched by this scan (assigned to confusing contact {}). Retrying tracking (retry count: {}).",
+                                contact_id, confusing_id, intended_contact.tracking_retry_count
+                            );
+                        }
+                        
+                        // Draw red search gate for the missed contact
+                        if let Some(contact) = self.contacts.iter().find(|co| co.id == contact_id) {
+                            let expected_pos = contact.current_position();
+                            let ci_radius = 3.89 * contact.current_pos_uncertainty();
+                            let stats = contact.class.default_stats();
+                            let mut max_acc = stats.max_forward_acceleration
+                                .max(stats.max_backward_acceleration)
+                                .max(stats.max_lateral_acceleration);
+                            if contact.class == Class::Fighter || contact.class == Class::Missile {
+                                max_acc += 100.0;
+                            }
+                            let dt_sec = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
+                            let fallback = 0.5 * max_acc * dt_sec * dt_sec;
+                            let gate_radius = ci_radius.max(10.0) + fallback;
+                            draw_polygon(expected_pos, gate_radius, 16, 0.0, rgb(255, 0, 0)); // Red color
                         }
                     }
-                    if !found {
-                        self.contacts.retain(|co| co.id != contact_id);
-                    }
                 }
-            }
-        } else {
-            if let RadarState::Tracking { contact_id } = self.active_radar_state {
-                self.contacts.retain(|co| co.id != contact_id);
-            }
-        }
-
-        // 2. Tracking update: extrapolate positions for contacts not scanned in this tick
-        for contact in &mut self.contacts {
-            if contact.last_scanned < current_t {
-                let dt = TICK_LENGTH;
-                contact.velocity += contact.acceleration * dt;
-                contact.position += contact.velocity * dt;
-                contact.pos_uncertainty += contact.vel_uncertainty * dt;
             }
         }
 
         // 3. Prune old contacts (timeout after 120 ticks / 2 seconds)
-        self.contacts.retain(|c| current_t - c.last_scanned <= 120);
-
-        // 4. Schedule radar state and configure hardware for NEXT tick
-        let mut target_to_track: Option<&Contact> = None;
-        let mut earliest_next_track_tick = u32::MAX;
-
-        for contact in &self.contacts {
-            let is_priority = self.priority_targets.contains(&contact.id);
-            let interval = if is_priority { 6 } else { 30 };
-            let next_track_tick = contact.last_scanned + interval;
-            if next_track_tick < earliest_next_track_tick {
-                earliest_next_track_tick = next_track_tick;
-                target_to_track = Some(contact);
+        self.contacts.retain(|c| {
+            let keep = current_t - c.last_scanned <= 120;
+            if !keep {
+                let current_pos = c.current_position();
+                debug!("removed {}: pos=None expect=({:.1}, {:.1}) gate=None", c.id, current_pos.x, current_pos.y);
             }
-        }
+            keep
+        });
 
-        let next_radar_state = if let Some(contact) = target_to_track {
-            if earliest_next_track_tick > current_t {
-                RadarState::Scanning
+        // 4. Generate jobs for next tick
+        let mut tracking_contacts = Vec::new();
+        for contact in &self.contacts {
+            let is_priority = self.priority_targets.contains(&contact.id) || contact.provisional;
+            let interval = if is_priority { self.priority_track_interval } else { 30 };
+            let next_track_tick = if contact.provisional {
+                current_t
             } else {
-                RadarState::Tracking { contact_id: contact.id }
-            }
-        } else {
-            RadarState::Scanning
-        };
+                contact.last_scanned + interval * (1 + contact.tracking_retry_count)
+            };
+            tracking_contacts.push((is_priority, next_track_tick, contact));
+        }
+        tracking_contacts.sort_by_key(|&(is_priority, next_track_tick, _)| (!is_priority, next_track_tick));
 
-        if let RadarState::Scanning = next_radar_state {
-            self.scan_ticks += 1;
-            if self.scan_ticks >= 11 {
-                self.scan_ticks -= 11;
-                self.full_scans += 1;
+        let mut tracking_jobs = Vec::new();
+        for (_, next_track_tick, contact) in tracking_contacts {
+            if next_track_tick <= current_t {
+                let next_pos = contact.position_at(current_t + 1);
+                let next_our_pos = position() + velocity() * TICK_LENGTH;
+                let d = next_our_pos.distance(next_pos);
+                let mut angle = (next_pos - next_our_pos).angle();
+
+                let next_pos_uncertainty = contact.pos_uncertainty_at(current_t + 1);
+                let gate_radius = (3.89 * next_pos_uncertainty).max(self.gate_radius);
+
+                let mut calculated_width = (2.0 * gate_radius / d).clamp(0.005, self.tracking_width);
+                let mut min_distance = (d - (3.89 * next_pos_uncertainty).max(10.0)).max(0.0);
+                let mut max_distance = d + (3.89 * next_pos_uncertainty).max(10.0);
+
+                // Exclude confusing contact if present and active
+                if let Some(confusing_id) = contact.confusing_contact {
+                    if let Some(confusing_contact) = self.contacts.iter().find(|c| c.id == confusing_id) {
+                        let confusing_pos = confusing_contact.position_at(current_t + 1);
+                        let confusing_d = next_our_pos.distance(confusing_pos);
+                        let confusing_angle = (confusing_pos - next_our_pos).angle();
+                        
+                        let confusing_unc = confusing_contact.pos_uncertainty_at(current_t + 1);
+                        let confusing_gate = (3.89 * confusing_unc).max(self.gate_radius);
+
+                        // Try adjusting the filter distance first: scanning either in front of or behind confusing contact.
+                        let mut distance_adjusted = false;
+                        if d < confusing_d {
+                            // Confusing contact is behind the target. Try to scan in front of it.
+                            let limit = confusing_d - confusing_gate;
+                            if limit > d - gate_radius {
+                                max_distance = max_distance.min(limit);
+                                if max_distance > min_distance {
+                                    distance_adjusted = true;
+                                    debug!("Excluding confusing contact {} for target {} by adjusting distance (scanning in front: max_distance = {:.1}m)", confusing_id, contact.id, max_distance);
+                                }
+                            }
+                        } else if d > confusing_d {
+                            // Confusing contact is in front of the target. Try to scan behind it.
+                            let limit = confusing_d + confusing_gate;
+                            if limit < d + gate_radius {
+                                min_distance = min_distance.max(limit);
+                                if max_distance > min_distance {
+                                    distance_adjusted = true;
+                                    debug!("Excluding confusing contact {} for target {} by adjusting distance (scanning behind: min_distance = {:.1}m)", confusing_id, contact.id, min_distance);
+                                }
+                            }
+                        }
+
+                        // If distance exclusion is not possible, adjust the radar sweep angle and width
+                        if !distance_adjusted {
+                            let gate_angle = gate_radius / d;
+                            let confusing_gate_angle = confusing_gate / confusing_d;
+                            
+                            // Normalize confusing_angle relative to target angle to handle TAU wrap-around
+                            let norm_confusing_angle = angle + angle_diff(angle, confusing_angle);
+                            
+                            if norm_confusing_angle > angle {
+                                let confusing_min_a = norm_confusing_angle - confusing_gate_angle;
+                                let target_min_a = angle - gate_angle;
+                                let target_max_a = angle + gate_angle;
+                                let new_max_a = target_max_a.min(confusing_min_a);
+                                if new_max_a > target_min_a {
+                                    angle = (target_min_a + new_max_a) / 2.0;
+                                    calculated_width = new_max_a - target_min_a;
+                                    debug!("Excluding confusing contact {} for target {} by shifting sweep to the right (angle = {:.3} rad, width = {:.3} rad)", confusing_id, contact.id, angle, calculated_width);
+                                }
+                            } else {
+                                let confusing_max_a = norm_confusing_angle + confusing_gate_angle;
+                                let target_min_a = angle - gate_angle;
+                                let target_max_a = angle + gate_angle;
+                                let new_min_a = target_min_a.max(confusing_max_a);
+                                if target_max_a > new_min_a {
+                                    angle = (new_min_a + target_max_a) / 2.0;
+                                    calculated_width = target_max_a - new_min_a;
+                                    debug!("Excluding confusing contact {} for target {} by shifting sweep to the left (angle = {:.3} rad, width = {:.3} rad)", confusing_id, contact.id, angle, calculated_width);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                tracking_jobs.push(RadarJob {
+                    angle,
+                    width: calculated_width.clamp(0.005, self.tracking_width),
+                    min_distance,
+                    max_distance,
+                    state: RadarState::Tracking { contact_id: contact.id },
+                });
             }
         }
 
-        self.configure_hardware(next_radar_state);
+        // Assign jobs to available radars
+        let mut tracking_index = 0;
+        for i in 0..num_radars {
+            if tracking_index < tracking_jobs.len() {
+                let job = tracking_jobs[tracking_index];
+                tracking_index += 1;
 
-        // 5. Draw 99.99% confidence intervals for all active contacts
-        for contact in &self.contacts {
-            let radius = 3.89 * contact.pos_uncertainty;
-            draw_polygon(contact.position, radius, 16, 0.0, rgb(255, 165, 0)); // Orange color
-            
-            // Draw a label with range and uncertainty
-            let text_pos = contact.position + vec2(0.0, radius + 20.0);
-            draw_text!(text_pos, rgb(255, 165, 0), "Target CI: {:.1}m", radius);
-        }
+                select_radar(i);
+                set_radar_heading(job.angle);
+                set_radar_width(job.width);
+                set_radar_min_distance(job.min_distance);
+                set_radar_max_distance(job.max_distance);
+                
+                self.radar_states[i] = job.state;
+                self.prev_slices[i] = Some(ScanSlice {
+                    angle: job.angle,
+                    width: job.width,
+                    min_distance: job.min_distance,
+                    max_distance: job.max_distance,
+                });
+            } else {
+                let target = self.current_target_id.and_then(|id| {
+                    self.contacts.iter().find(|c| c.id == id)
+                });
+                let slice = self.slice_generator.next_slice(target);
 
-        self.active_radar_state = next_radar_state;
-    }
+                select_radar(i);
+                set_radar_heading(slice.angle);
+                set_radar_width(slice.width);
+                set_radar_min_distance(slice.min_distance);
+                set_radar_max_distance(slice.max_distance);
+                
+                self.radar_states[i] = RadarState::Scanning;
+                self.prev_slices[i] = Some(slice);
 
-    fn configure_hardware(&mut self, state: RadarState) {
-        match state {
-            RadarState::Scanning => {
-                let sweep_head = self.last_scan_heading.unwrap_or_else(|| radar_heading()) + self.search_width;
-                set_radar_heading(sweep_head);
-                self.last_scan_heading = Some(sweep_head);
-                set_radar_width(self.search_width);
-                set_radar_min_distance(0.0);
-                set_radar_max_distance(self.max_distance);
-            }
-            RadarState::Tracking { contact_id } => {
-                if let Some(contact) = self.contacts.iter().find(|c| c.id == contact_id) {
-                    let next_pos = contact.position + contact.velocity * TICK_LENGTH + 0.5 * contact.acceleration * TICK_LENGTH * TICK_LENGTH;
-                    let next_our_pos = position() + velocity() * TICK_LENGTH;
-                    let d = next_our_pos.distance(next_pos);
-                    let angle = (next_pos - next_our_pos).angle();
-                    set_radar_heading(angle);
-                    
-                    // Extrapolate position uncertainty to the next tick's scan
-                    let next_pos_uncertainty = contact.pos_uncertainty + contact.vel_uncertainty * TICK_LENGTH;
-                    let gate_radius = (3.89 * next_pos_uncertainty).max(self.gate_radius);
-                    
-                    // Dynamic tracking beam width based on distance and dynamic gate radius
-                    let calculated_width = (2.0 * gate_radius / d).clamp(0.005, self.tracking_width);
-                    set_radar_width(calculated_width);
-                    
-                    // Distance clipping to isolate the target from noise/jamming
-                    // Set depth of the radar tracking box approximately to the diameter of the 99.99% CI circle,
-                    // with a minimum radius value of 20.0m to prevent the gate from becoming too narrow.
-                    let ci_radius = (3.89 * next_pos_uncertainty).max(20.0);
-                    set_radar_min_distance((d - ci_radius).max(0.0));
-                    set_radar_max_distance(d + ci_radius);
-                } else {
-                    let sweep_head = self.last_scan_heading.unwrap_or_else(|| radar_heading()) + self.search_width;
-                    set_radar_heading(sweep_head);
-                    self.last_scan_heading = Some(sweep_head);
-                    set_radar_width(self.search_width);
-                    set_radar_min_distance(0.0);
-                    set_radar_max_distance(self.max_distance);
+                self.last_scan_heading = Some(slice.angle);
+                self.scan_ticks += 1;
+                if self.scan_ticks >= 11 {
+                    self.scan_ticks -= 11;
+                    self.full_scans += 1;
                 }
             }
         }
+
+        // 5. Draw 99.99% confidence intervals for all active contacts
+        for contact in &self.contacts {
+            let radius = 3.89 * contact.current_pos_uncertainty();
+            draw_polygon(contact.current_position(), radius, 16, 0.0, rgb(255, 165, 0)); // Orange color
+
+            // Draw maximum acceleration possible space
+            let dt_sec = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
+            if dt_sec > 0.0 {
+                let stats = contact.class.default_stats();
+                let mut max_acc = stats.max_forward_acceleration
+                    .max(stats.max_backward_acceleration)
+                    .max(stats.max_lateral_acceleration);
+                if contact.class == Class::Fighter || contact.class == Class::Missile {
+                    max_acc += 100.0;
+                }
+                let displacement_factor = 0.5 * dt_sec * (dt_sec + TICK_LENGTH);
+                let center = contact.current_position() - contact.acceleration * displacement_factor;
+                let max_acc_radius = max_acc * displacement_factor;
+                draw_polygon(center, max_acc_radius, 16, 0.0, rgb(0, 220, 255)); // Cyan/Light Blue color
+            }
+            
+            // Draw a label with range and uncertainty
+            let text_pos = contact.current_position() + vec2(0.0, radius + 20.0);
+            draw_text!(text_pos, rgb(255, 165, 0), "cid: {}", contact.id);
+        }
+
+        // Cache non-provisional contacts
+        self.non_provisional_contacts = self.contacts.iter()
+            .filter(|c| !c.provisional)
+            .cloned()
+            .collect();
     }
 
     pub fn update_target(&mut self, our_pos: Vec2, our_vel: Vec2) -> Option<Contact> {
         if let Some(target_id) = self.current_target_id {
-            if !self.contacts.iter().any(|c| c.id == target_id) {
+            if !self.contacts.iter().any(|c| c.id == target_id && !c.provisional) {
                 self.current_target_id = None;
             }
         }
@@ -306,8 +693,11 @@ impl RadarController {
             let mut closest_id = None;
             let mut min_future_dist = f64::MAX;
             for contact in &self.contacts {
+                if contact.provisional {
+                    continue;
+                }
                 let t_horizon = 2.0;
-                let target_pos_f = contact.position + contact.velocity * t_horizon + 0.5 * contact.acceleration * t_horizon * t_horizon;
+                let target_pos_f = contact.position_at(current_tick() + (t_horizon / TICK_LENGTH).round() as u32);
                 let our_pos_f = our_pos + our_vel * t_horizon;
                 let future_dist = target_pos_f.distance(our_pos_f);
 
@@ -338,6 +728,7 @@ impl RadarController {
                 contact.last_scanned = current_t;
                 contact.pos_uncertainty = 10.0;
                 contact.vel_uncertainty = 5.0;
+                contact.tracking_retry_count = 0;
                 found_id = Some(id);
             }
         }
@@ -353,6 +744,7 @@ impl RadarController {
                     // High precision radio telemetry resets uncertainty
                     contact.pos_uncertainty = 10.0;
                     contact.vel_uncertainty = 5.0;
+                    contact.tracking_retry_count = 0;
                     found_id = Some(contact.id);
                     break;
                 }
@@ -363,44 +755,75 @@ impl RadarController {
             id
         } else if let Some(id) = existing_id {
             // Recreate deleted contact using its existing ID
+            let last_scanned = current_t;
             self.contacts.push(Contact {
                 id,
                 class: Class::Fighter,
                 position: pos,
                 velocity: vel,
                 acceleration: accel,
-                last_scanned: current_t,
+                last_scanned,
                 rssi: 0.0,
                 snr: 50.0,
                 pos_uncertainty: 10.0,
                 vel_uncertainty: 5.0,
                 radar_locked: false,
+                provisional: false,
+                tracking_retry_count: 0,
+                confirmation_attempts: 0,
+                confusing_contact: None,
             });
             id
         } else {
             let id = self.next_contact_id;
+            let last_scanned = current_t;
             self.contacts.push(Contact {
                 id,
                 class: Class::Fighter,
                 position: pos,
                 velocity: vel,
                 acceleration: accel,
-                last_scanned: current_t,
+                last_scanned,
                 rssi: 0.0,
                 snr: 50.0,
                 pos_uncertainty: 10.0,
                 vel_uncertainty: 5.0,
                 radar_locked: false,
+                provisional: false,
+                tracking_retry_count: 0,
+                confirmation_attempts: 0,
+                confusing_contact: None,
             });
             self.next_contact_id += 1;
             id
         };
 
         // Force radar to track this contact and configure the hardware immediately
-        self.active_radar_state = RadarState::Tracking { contact_id };
-        self.configure_hardware(self.active_radar_state);
+        self.radar_states[0] = RadarState::Tracking { contact_id };
+        select_radar(0);
+        if let Some(contact) = self.contacts.iter().find(|c| c.id == contact_id) {
+            let next_pos = contact.position_at(current_t + 1);
+            let next_our_pos = position() + velocity() * TICK_LENGTH;
+            let d = next_our_pos.distance(next_pos);
+            let angle = (next_pos - next_our_pos).angle();
+            set_radar_heading(angle);
+            
+            let next_pos_uncertainty = contact.pos_uncertainty_at(current_t + 1);
+            let gate_radius = (3.89 * next_pos_uncertainty).max(self.gate_radius);
+            
+            let calculated_width = (2.0 * gate_radius / d).clamp(0.005, self.tracking_width);
+            set_radar_width(calculated_width);
+            
+            let ci_radius = (3.89 * next_pos_uncertainty).max(10.0);
+            set_radar_min_distance((d - ci_radius).max(0.0));
+            set_radar_max_distance(d + ci_radius);
+        }
+
+        self.non_provisional_contacts = self.contacts.iter()
+            .filter(|c| !c.provisional)
+            .cloned()
+            .collect();
 
         contact_id
     }
 }
-

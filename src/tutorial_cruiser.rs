@@ -9,13 +9,16 @@ struct ExpectedIntercept {
 
 pub struct Ship {
     radar_controller: RadarController,
-    weapon_targets: [Option<u32>; 4], // Targets assigned to weapon slots 0, 1, 2, and 3 (missile)
+    weapon_targets: [Option<u32>; 4], // Targets assigned to weapon slots 0, 1, and 2
     angle_tracker: AngleTracker,      // Tracks Gun 0 target angle rate for ship orientation
     intercept_plots: Vec<ExpectedIntercept>, // Intercept points to draw for active bullets
     missile_guidance: MissileGuidance,
-    just_fired_missile: bool,
-    previous_missile_target_id: Option<u32>,
-    current_missile_target_id: Option<u32>,
+    
+    // Missile launching control state
+    last_missile_fired_tick: u32,
+    broadcast_target_id: Option<u32>,
+    broadcast_ticks: u32,
+    
     missile_launch_history: Vec<(u32, u32)>, // Tracks targets recently fired at by missiles: (target_id, tick_launched)
     seen_target_ids: Vec<u32>,
 }
@@ -81,7 +84,7 @@ impl Ship {
         let mut mg = MissileGuidance::new();
         mg.target_channel = 3;
 
-        // Pre-tune the frigate's radio slot 0 to target channel 3 to avoid the 1-tick delay
+        // Pre-tune the cruiser's radio slot 0 to target channel 3 to avoid the 1-tick delay
         select_radio(0);
         set_radio_channel(mg.target_channel);
 
@@ -91,16 +94,16 @@ impl Ship {
             angle_tracker: AngleTracker::new(5.0),
             intercept_plots: Vec::new(),
             missile_guidance: mg,
-            just_fired_missile: false,
-            previous_missile_target_id: None,
-            current_missile_target_id: None,
+            last_missile_fired_tick: 0,
+            broadcast_target_id: None,
+            broadcast_ticks: 0,
             missile_launch_history: Vec::new(),
             seen_target_ids: Vec::new(),
         }
     }
 
     fn num_guns_targeting(&self, target_id: u32, exclude_weapon: Option<usize>) -> usize {
-        let active_guns = (0..4)
+        let active_guns = (0..3)
             .filter(|&w| Some(w) != exclude_weapon && self.weapon_targets[w] == Some(target_id))
             .count();
         let recent_missiles = self.missile_launch_history.iter().filter(|&&(id, _)| id == target_id).count();
@@ -125,45 +128,42 @@ impl Ship {
         let ship_pos = position();
         match w {
             0 => {
-                let angle_a = (a.current_position() - ship_pos).angle();
-                let angle_b = (b.current_position() - ship_pos).angle();
-                let diff_a = angle_diff(heading(), angle_a).abs();
-                let diff_b = angle_diff(heading(), angle_b).abs();
-                diff_a < diff_b
-            }
-            1 | 2 => {
+                // Gun 0: Turreted heavy cannon. Targets closest fighter (same as frigate's turreted guns).
                 let dist_a = ship_pos.distance(a.current_position());
                 let dist_b = ship_pos.distance(b.current_position());
                 dist_a < dist_b
             }
-            3 => {
-                let t_a = if let Some((t, _)) = predict_lead_exact(
-                    ship_pos,
-                    velocity(),
-                    1000.0,
-                    a.current_position(),
-                    a.current_velocity(),
-                    a.acceleration,
-                ) {
-                    t
+            1 => {
+                // Gun 1: Left missile launcher. Prefers targets on the left side.
+                let angle_a = (a.current_position() - ship_pos).angle();
+                let angle_b = (b.current_position() - ship_pos).angle();
+                let diff_a = angle_diff(heading(), angle_a);
+                let diff_b = angle_diff(heading(), angle_b);
+                let a_on_left = diff_a >= 0.0;
+                let b_on_left = diff_b >= 0.0;
+                if a_on_left != b_on_left {
+                    a_on_left
                 } else {
-                    ship_pos.distance(a.current_position()) / 1000.0 + 1000.0
-                };
-
-                let t_b = if let Some((t, _)) = predict_lead_exact(
-                    ship_pos,
-                    velocity(),
-                    1000.0,
-                    b.current_position(),
-                    b.current_velocity(),
-                    b.acceleration,
-                ) {
-                    t
+                    let dist_a = ship_pos.distance(a.current_position());
+                    let dist_b = ship_pos.distance(b.current_position());
+                    dist_a < dist_b
+                }
+            }
+            2 => {
+                // Gun 2: Right missile launcher. Prefers targets on the right side.
+                let angle_a = (a.current_position() - ship_pos).angle();
+                let angle_b = (b.current_position() - ship_pos).angle();
+                let diff_a = angle_diff(heading(), angle_a);
+                let diff_b = angle_diff(heading(), angle_b);
+                let a_on_right = diff_a < 0.0;
+                let b_on_right = diff_b < 0.0;
+                if a_on_right != b_on_right {
+                    a_on_right
                 } else {
-                    ship_pos.distance(b.current_position()) / 1000.0 + 1000.0
-                };
-
-                t_a > t_b
+                    let dist_a = ship_pos.distance(a.current_position());
+                    let dist_b = ship_pos.distance(b.current_position());
+                    dist_a < dist_b
+                }
             }
             _ => false,
         }
@@ -179,11 +179,9 @@ impl Ship {
 
         // 0. Update priority targets list based on weapon targeting and reload status
         let mut priority_ids = Vec::new();
-        for w in 0..4 {
+        for w in 0..3 {
             if let Some(tid) = self.weapon_targets[w] {
-                if reload_ticks(w) <= 5 {
-                    priority_ids.push(tid);
-                }
+                priority_ids.push(tid);
             }
         }
         self.radar_controller.priority_targets = priority_ids;
@@ -209,7 +207,7 @@ impl Ship {
 
         // 3. Update Weapon Assignments
         // Prune targets that are no longer tracked/alive
-        for w in 0..4 {
+        for w in 0..3 {
             if let Some(tid) = self.weapon_targets[w] {
                 if !fighters.iter().any(|f| f.id == tid) {
                     self.weapon_targets[w] = None;
@@ -217,23 +215,22 @@ impl Ship {
             }
         }
 
-        // Missile exception: if missile's current target was recently launched at,
-        // and other unlaunched targets exist, clear it to pick a new one.
-        if let Some(tid) = self.weapon_targets[3] {
-            let target_in_history = self.missile_launch_history.iter().any(|&(id, _)| id == tid);
-            let other_unlaunched_exists = fighters.iter().any(|f| {
-                !self.missile_launch_history.iter().any(|&(id, _)| id == f.id)
-            });
-            if target_in_history && other_unlaunched_exists {
-                self.weapon_targets[3] = None;
+        // Missile exception for Guns 1 and 2: if target was recently launched at,
+        // and other unlaunched targets exist, clear target to find a new one.
+        for &w in &[1, 2] {
+            if let Some(tid) = self.weapon_targets[w] {
+                let target_in_history = self.missile_launch_history.iter().any(|&(id, _)| id == tid);
+                let other_unlaunched_exists = fighters.iter().any(|f| {
+                    !self.missile_launch_history.iter().any(|&(id, _)| id == f.id)
+                });
+                if target_in_history && other_unlaunched_exists {
+                    self.weapon_targets[w] = None;
+                }
             }
         }
 
         // Build list of weapons that are ready and need assignment (currently have None target)
         let mut assignment_order = Vec::new();
-        if self.weapon_targets[3].is_none() && reload_ticks(3) <= 4 {
-            assignment_order.push(3);
-        }
         if self.weapon_targets[0].is_none() {
             assignment_order.push(0);
         }
@@ -247,8 +244,8 @@ impl Ship {
         for &w in &assignment_order {
             let mut best_fighter: Option<&crate::radar::Contact> = None;
             for f in &fighters {
-                // If we've seen less than 4 targets, do not allow duplicate target assignments.
-                if self.seen_target_ids.len() < 4 {
+                // If we've seen less than 3 targets, do not allow duplicate target assignments.
+                if self.seen_target_ids.len() < 3 {
                     let total_targeting = self.num_guns_targeting(f.id, Some(w));
                     if total_targeting > 0 {
                         continue;
@@ -269,12 +266,11 @@ impl Ship {
         }
 
         // 4. Weapon Aiming and Firing
-        // Gun 0: Forward-pointing high-velocity gun (Bullet Speed: 4000.0 m/s, Local Offset: [40.0, 0.0])
+        // Gun 0: Turreted heavy cannon (Bullet Speed: 2000.0 m/s)
         if let Some(tid) = self.weapon_targets[0] {
             if let Some(f) = fighters.iter().find(|fighter| fighter.id == tid) {
-                const GUN0_BULLET_SPEED: f64 = 4000.0;
-                let gun0_offset = Vec2::new(40.0, 0.0);
-                let gun0_pos = position() + gun0_offset.rotate(heading());
+                const GUN0_BULLET_SPEED: f64 = 2000.0;
+                let gun0_pos = position();
 
                 if let Some((time_to_impact, lead_dir)) = predict_lead_exact(
                     gun0_pos,
@@ -285,6 +281,9 @@ impl Ship {
                     f.acceleration,
                 ) {
                     let lead_angle = lead_dir.angle();
+                    aim(0, lead_angle);
+
+                    // Rotate the ship to face the target generally to facilitate radar sweep/movement
                     let target_omega = self.angle_tracker.update(lead_angle);
                     quick_turn_with_target_omega(lead_angle, target_omega);
 
@@ -293,9 +292,7 @@ impl Ship {
                     draw_line(gun0_pos, p_e, rgb(255, 0, 0));
                     draw_square(p_e, 25.0, rgb(255, 0, 0));
 
-                    // Fire when aligned within 1.0 degree of lead angle
-                    let diff = angle_diff(heading(), lead_angle);
-                    if reload_ticks(0) == 0 && diff.abs() < 0.1f64.to_radians() {
+                    if reload_ticks(0) == 0 {
                         fire(0);
                         let expiry_tick = current_tick + (time_to_impact / TICK_LENGTH).round() as u32;
                         self.intercept_plots.push(ExpectedIntercept {
@@ -305,12 +302,13 @@ impl Ship {
                     }
                 } else {
                     let direct_angle = (f.current_position() - gun0_pos).angle();
+                    aim(0, direct_angle);
                     let target_omega = self.angle_tracker.update(direct_angle);
                     quick_turn_with_target_omega(direct_angle, target_omega);
                 }
             }
         } else {
-            // If Gun 0 is unassigned, turn towards one of the other guns' targets if available
+            // Turn ship towards fallback target
             let fallback_target = self.weapon_targets[1]
                 .or(self.weapon_targets[2])
                 .and_then(|tid| fighters.iter().find(|f| f.id == tid));
@@ -321,98 +319,61 @@ impl Ship {
             }
         }
 
-        // Guns 1 and 2: Turreted guns (Bullet Speed: 1000.0 m/s, Local Offsets: [0.0, 30.0] and [0.0, -30.0])
-        const TURRET_BULLET_SPEED: f64 = 1000.0;
-        for &w in &[1, 2] {
-            if let Some(tid) = self.weapon_targets[w] {
-                if let Some(f) = fighters.iter().find(|fighter| fighter.id == tid) {
-                    let gun_offset = if w == 1 {
-                        Vec2::new(0.0, 30.0)
-                    } else {
-                        Vec2::new(0.0, -30.0)
-                    };
-                    let gun_pos = position() + gun_offset.rotate(heading());
-
-                    if let Some((time_to_impact, lead_dir)) = predict_lead_exact(
-                        gun_pos,
-                        velocity(),
-                        TURRET_BULLET_SPEED,
-                        f.current_position(),
-                        f.current_velocity(),
-                        f.acceleration,
-                    ) {
-                        let lead_angle = lead_dir.angle();
-                        let p_e = f.position_at(current_tick + (time_to_impact / TICK_LENGTH).round() as u32);
-                        let dist = gun_pos.distance(p_e);
-                        let max_angle_offset = if dist > 0.0 { 10.0 / dist } else { 0.0 };
-                        let angle_offset = rand(-max_angle_offset, max_angle_offset);
-                        let target_angle = lead_angle + angle_offset;
-                        aim(w, target_angle);
-
-                        // Visualization
-                        draw_line(gun_pos, p_e, rgb(0, 255, 0));
-                        draw_triangle(p_e, 20.0, rgb(0, 255, 0));
-
-                        if reload_ticks(w) == 0 {
-                            fire(w);
-                            let expiry_tick = current_tick + (time_to_impact / TICK_LENGTH).round() as u32;
-                            let shot_dir = Vec2::new(target_angle.cos(), target_angle.sin());
-                            let randomized_p_e = gun_pos + dist * shot_dir;
-                            self.intercept_plots.push(ExpectedIntercept {
-                                position: randomized_p_e,
-                                expiry_tick,
-                            });
-                        }
-                    } else {
-                        let direct_angle = (f.current_position() - gun_pos).angle();
-                        aim(w, direct_angle);
-                    }
-                }
-            }
-        }
-
-        // 4.5. Radio Broadcasting and Missile Weapon Slot 3
-        let mut should_broadcast = false;
-        if self.just_fired_missile {
-            should_broadcast = true;
-            self.just_fired_missile = false;
-        }
-
-        if should_broadcast {
-            if let Some(tid) = self.current_missile_target_id {
-                if Some(tid) != self.previous_missile_target_id {
-                    if let Some(f) = fighters.iter().find(|fighter| fighter.id == tid) {
-                        select_radio(0);
-                        let f_pos = f.current_position();
-                        let f_vel = f.current_velocity();
-                        debug!("Frigate broadcasting target telemetry: id={}, pos=({:.1}, {:.1}) vel=({:.1}, {:.1}) on channel {}", f.id, f_pos.x, f_pos.y, f_vel.x, f_vel.y, self.missile_guidance.target_channel);
-                        send([f_pos.x, f_pos.y, f_vel.x, f_vel.y]);
-                    }
-                }
-            }
-        }
-
+        // 4.5. Missile Launching and Radio Broadcasting (Guns 1 & 2)
         let mut fired_missile_this_tick = false;
-        if let Some(tid) = self.weapon_targets[3] {
-            if reload_ticks(3) == 0 {
-                fire(3);
-                fired_missile_this_tick = true;
-                self.missile_launch_history.retain(|&(mid, _)| mid != tid);
-                self.missile_launch_history.push((tid, current_tick));
+        let mut fired_target_id = None;
+
+        // Ensure we never fire two missiles within three ticks of each other.
+        // This spaces out locks on the single radio channel 3.
+        if current_tick - self.last_missile_fired_tick >= 3 {
+            let mut launched_slot = None;
+            if self.weapon_targets[1].is_some() && reload_ticks(1) == 0 {
+                launched_slot = Some(1);
+            } else if self.weapon_targets[2].is_some() && reload_ticks(2) == 0 {
+                launched_slot = Some(2);
+            }
+
+            if let Some(w) = launched_slot {
+                if let Some(tid) = self.weapon_targets[w] {
+                    fire(w);
+                    fired_missile_this_tick = true;
+                    fired_target_id = Some(tid);
+                    self.last_missile_fired_tick = current_tick;
+
+                    // Update launch history
+                    self.missile_launch_history.retain(|&(mid, _)| mid != tid);
+                    self.missile_launch_history.push((tid, current_tick));
+
+                    // Clear assignment immediately to target a different enemy on subsequent launch
+                    self.weapon_targets[w] = None;
+                }
             }
         }
 
+        // Update broadcast state
         if fired_missile_this_tick {
-            self.previous_missile_target_id = self.current_missile_target_id;
-            self.current_missile_target_id = self.weapon_targets[3];
+            self.broadcast_target_id = fired_target_id;
+            self.broadcast_ticks = 1;
+        } else if self.broadcast_target_id.is_some() {
+            self.broadcast_ticks += 1;
+            if self.broadcast_ticks > 2 {
+                self.broadcast_target_id = None;
+                self.broadcast_ticks = 0;
+            }
         }
-        self.just_fired_missile = fired_missile_this_tick;
+
+        // Broadcast active target telemetry on channel 3
+        if let Some(tid) = self.broadcast_target_id {
+            if let Some(f) = fighters.iter().find(|fighter| fighter.id == tid) {
+                select_radio(0);
+                set_radio_channel(3);
+                send([f.current_position().x, f.current_position().y, f.current_velocity().x, f.current_velocity().y]);
+            }
+        }
 
         // 5. Draw expected intercept plots for debug
-        // Retain only plots whose expected time is in the future
         self.intercept_plots.retain(|plot| current_tick <= plot.expiry_tick);
         for plot in &self.intercept_plots {
-            // Draw a small red circle (modeled as an 8-sided polygon with radius 8.0)
             draw_polygon(plot.position, 8.0, 8, 0.0, rgb(255, 0, 0));
         }
 

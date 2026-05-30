@@ -99,40 +99,41 @@ impl Ship {
         }
     }
 
+    fn num_guns_targeting(&self, target_id: u32, exclude_weapon: Option<usize>) -> usize {
+        let active_guns = (0..4)
+            .filter(|&w| Some(w) != exclude_weapon && self.weapon_targets[w] == Some(target_id))
+            .count();
+        let recent_missiles = self.missile_launch_history.iter().filter(|&&(id, _)| id == target_id).count();
+        active_guns + recent_missiles
+    }
+
     fn is_better_target(&self, w: usize, a: &crate::radar::Contact, b: &crate::radar::Contact) -> bool {
-        let num_guns_a = (0..4)
-            .filter(|&other_w| other_w != w && self.weapon_targets[other_w] == Some(a.id))
-            .count();
-        let num_guns_b = (0..4)
-            .filter(|&other_w| other_w != w && self.weapon_targets[other_w] == Some(b.id))
-            .count();
+        let total_targeting_a = self.num_guns_targeting(a.id, Some(w));
+        let total_targeting_b = self.num_guns_targeting(b.id, Some(w));
 
-        let in_missile_a = self.missile_launch_history.iter().any(|&(id, _)| id == a.id);
-        let in_missile_b = self.missile_launch_history.iter().any(|&(id, _)| id == b.id);
-
-        let is_clean_a = num_guns_a == 0 && !in_missile_a;
-        let is_clean_b = num_guns_b == 0 && !in_missile_b;
+        let is_clean_a = total_targeting_a == 0;
+        let is_clean_b = total_targeting_b == 0;
 
         if is_clean_a != is_clean_b {
             return is_clean_a;
         }
 
-        if num_guns_a != num_guns_b {
-            return num_guns_a < num_guns_b;
+        if total_targeting_a != total_targeting_b {
+            return total_targeting_a < total_targeting_b;
         }
 
         let ship_pos = position();
         match w {
             0 => {
-                let angle_a = (a.position - ship_pos).angle();
-                let angle_b = (b.position - ship_pos).angle();
+                let angle_a = (a.current_position() - ship_pos).angle();
+                let angle_b = (b.current_position() - ship_pos).angle();
                 let diff_a = angle_diff(heading(), angle_a).abs();
                 let diff_b = angle_diff(heading(), angle_b).abs();
                 diff_a < diff_b
             }
             1 | 2 => {
-                let dist_a = ship_pos.distance(a.position);
-                let dist_b = ship_pos.distance(b.position);
+                let dist_a = ship_pos.distance(a.current_position());
+                let dist_b = ship_pos.distance(b.current_position());
                 dist_a < dist_b
             }
             3 => {
@@ -140,26 +141,26 @@ impl Ship {
                     ship_pos,
                     velocity(),
                     1000.0,
-                    a.position,
-                    a.velocity,
+                    a.current_position(),
+                    a.current_velocity(),
                     a.acceleration,
                 ) {
                     t
                 } else {
-                    ship_pos.distance(a.position) / 1000.0 + 1000.0
+                    ship_pos.distance(a.current_position()) / 1000.0 + 1000.0
                 };
 
                 let t_b = if let Some((t, _)) = predict_lead_exact(
                     ship_pos,
                     velocity(),
                     1000.0,
-                    b.position,
-                    b.velocity,
+                    b.current_position(),
+                    b.current_velocity(),
                     b.acceleration,
                 ) {
                     t
                 } else {
-                    ship_pos.distance(b.position) / 1000.0 + 1000.0
+                    ship_pos.distance(b.current_position()) / 1000.0 + 1000.0
                 };
 
                 t_a > t_b
@@ -248,10 +249,8 @@ impl Ship {
             for f in &fighters {
                 // If we've seen less than 4 targets, do not allow duplicate target assignments.
                 if self.seen_target_ids.len() < 4 {
-                    let num_guns = (0..4)
-                        .filter(|&other_w| other_w != w && self.weapon_targets[other_w] == Some(f.id))
-                        .count();
-                    if num_guns > 0 {
+                    let total_targeting = self.num_guns_targeting(f.id, Some(w));
+                    if total_targeting > 0 {
                         continue;
                     }
                 }
@@ -281,8 +280,8 @@ impl Ship {
                     gun0_pos,
                     velocity(),
                     GUN0_BULLET_SPEED,
-                    f.position,
-                    f.velocity,
+                    f.current_position(),
+                    f.current_velocity(),
                     f.acceleration,
                 ) {
                     let lead_angle = lead_dir.angle();
@@ -290,7 +289,7 @@ impl Ship {
                     quick_turn_with_target_omega(lead_angle, target_omega);
 
                     // Visualization
-                    let p_e = f.position + time_to_impact * f.velocity + 0.5 * f.acceleration * time_to_impact * (time_to_impact + TICK_LENGTH);
+                    let p_e = f.position_at(current_tick + (time_to_impact / TICK_LENGTH).round() as u32);
                     draw_line(gun0_pos, p_e, rgb(255, 0, 0));
                     draw_square(p_e, 25.0, rgb(255, 0, 0));
 
@@ -305,7 +304,7 @@ impl Ship {
                         });
                     }
                 } else {
-                    let direct_angle = (f.position - gun0_pos).angle();
+                    let direct_angle = (f.current_position() - gun0_pos).angle();
                     let target_omega = self.angle_tracker.update(direct_angle);
                     quick_turn_with_target_omega(direct_angle, target_omega);
                 }
@@ -316,7 +315,7 @@ impl Ship {
                 .or(self.weapon_targets[2])
                 .and_then(|tid| fighters.iter().find(|f| f.id == tid));
             if let Some(f) = fallback_target {
-                let direct_angle = (f.position - position()).angle();
+                let direct_angle = (f.current_position() - position()).angle();
                 let target_omega = self.angle_tracker.update(direct_angle);
                 quick_turn_with_target_omega(direct_angle, target_omega);
             }
@@ -338,12 +337,12 @@ impl Ship {
                         gun_pos,
                         velocity(),
                         TURRET_BULLET_SPEED,
-                        f.position,
-                        f.velocity,
+                        f.current_position(),
+                        f.current_velocity(),
                         f.acceleration,
                     ) {
                         let lead_angle = lead_dir.angle();
-                        let p_e = f.position + time_to_impact * f.velocity + 0.5 * f.acceleration * time_to_impact * (time_to_impact + TICK_LENGTH);
+                        let p_e = f.position_at(current_tick + (time_to_impact / TICK_LENGTH).round() as u32);
                         let dist = gun_pos.distance(p_e);
                         let max_angle_offset = if dist > 0.0 { 10.0 / dist } else { 0.0 };
                         let angle_offset = rand(-max_angle_offset, max_angle_offset);
@@ -365,7 +364,7 @@ impl Ship {
                             });
                         }
                     } else {
-                        let direct_angle = (f.position - gun_pos).angle();
+                        let direct_angle = (f.current_position() - gun_pos).angle();
                         aim(w, direct_angle);
                     }
                 }
@@ -384,8 +383,10 @@ impl Ship {
                 if Some(tid) != self.previous_missile_target_id {
                     if let Some(f) = fighters.iter().find(|fighter| fighter.id == tid) {
                         select_radio(0);
-                        debug!("Frigate broadcasting target telemetry: id={}, pos=({:.1}, {:.1}) vel=({:.1}, {:.1}) on channel {}", f.id, f.position.x, f.position.y, f.velocity.x, f.velocity.y, self.missile_guidance.target_channel);
-                        send([f.position.x, f.position.y, f.velocity.x, f.velocity.y]);
+                        let f_pos = f.current_position();
+                        let f_vel = f.current_velocity();
+                        debug!("Frigate broadcasting target telemetry: id={}, pos=({:.1}, {:.1}) vel=({:.1}, {:.1}) on channel {}", f.id, f_pos.x, f_pos.y, f_vel.x, f_vel.y, self.missile_guidance.target_channel);
+                        send([f_pos.x, f_pos.y, f_vel.x, f_vel.y]);
                     }
                 }
             }
@@ -417,7 +418,7 @@ impl Ship {
 
         // 6. Draw a blue triangle at each contact's estimated position
         for contact in contacts {
-            draw_triangle(contact.position, 15.0, rgb(0, 0, 255));
+            draw_triangle(contact.current_position(), 15.0, rgb(0, 0, 255));
         }
     }
 }
