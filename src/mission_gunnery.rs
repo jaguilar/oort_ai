@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use oort_api::prelude::*;
-use crate::control::{quick_turn_with_target_omega, quick_turn_time_with_target_omega, predict_lead, format_sig_figs};
+use crate::control::{quick_turn_time_with_target_omega, predict_lead, format_sig_figs, quick_turn_torque_kinematic};
 use crate::radar::{RadarController, ScanSliceGenerator, ScanSlice, Contact};
 
 struct ExpectedIntercept {
@@ -29,6 +29,7 @@ pub struct Ship {
     intercept_plots: Vec<ExpectedIntercept>, // Intercept points to draw for active bullets
     fire_counts: HashMap<u32, u32>,    // Tracks count of shots fired on each target ID
     prev_intended_solution: Option<IntendedSolution>,
+    shot_fired_at_current: bool,
 }
 
 pub struct GunneryScanSliceGenerator {
@@ -105,6 +106,7 @@ impl Ship {
             intercept_plots: Vec::new(),
             fire_counts: HashMap::new(),
             prev_intended_solution: None,
+            shot_fired_at_current: true,
         }
     }
 
@@ -204,41 +206,53 @@ impl Ship {
 
 
         // 4. Update Weapon Assignment
-        // Select the tracked contact with the minimum number of firing attempts.
-        // If attempts are equal, choose the target that is furthest north in its firing solution.
-        let mut best_target: Option<&crate::radar::Contact> = None;
-        for c in contacts {
-            let sol = &solutions[&c.id];
-            let turn_time = self.target_aim_time(sol);
-            let sol_y = sol.aim_point_y;
-            let ci_c = 3.89 * c.current_pos_uncertainty();
-            debug!("Target {} considered: turn time = {:.3}s, firing sol Y = {:.1}m, CI = {:.1}m att={}", c.id, turn_time, sol_y, ci_c, *self.fire_counts.get(&c.id).unwrap_or(&0));
-
-            if let Some(best) = best_target {
-                let bad_c = ci_c > 50.0;
-                let bad_best = 3.89 * best.current_pos_uncertainty() > 50.0;
-
-                if bad_best && !bad_c {
-                    best_target = Some(c);
-                } else if !bad_best && bad_c {
-                    // Keep best, do nothing
-                } else {
-                    let attempts_c = *self.fire_counts.get(&c.id).unwrap_or(&0);
-                    let attempts_best = *self.fire_counts.get(&best.id).unwrap_or(&0);
-                    if attempts_c < attempts_best {
-                        best_target = Some(c);
-                    } else if attempts_c == attempts_best {
-                        let best_sol = &solutions[&best.id];
-                        if self.is_better_target(c.id, sol, best.id, best_sol) {
-                            best_target = Some(c);
-                        }
-                    }
-                }
-            } else {
-                best_target = Some(c);
+        let mut stick_to_target = false;
+        if let Some(tid) = self.weapon_target {
+            if !self.shot_fired_at_current && contacts.iter().any(|c| c.id == tid) {
+                stick_to_target = true;
             }
         }
-        self.weapon_target = best_target.map(|c| c.id);
+
+        if !stick_to_target {
+            // Select the tracked contact with the minimum number of firing attempts.
+            // If attempts are equal, choose the target that is furthest north in its firing solution.
+            let mut best_target: Option<&crate::radar::Contact> = None;
+            for c in contacts {
+                let sol = &solutions[&c.id];
+                let turn_time = self.target_aim_time(sol);
+                let sol_y = sol.aim_point_y;
+                let ci_c = 3.89 * c.current_pos_uncertainty();
+                debug!("Target {} considered: turn time = {:.3}s, firing sol Y = {:.1}m, CI = {:.1}m att={}", c.id, turn_time, sol_y, ci_c, *self.fire_counts.get(&c.id).unwrap_or(&0));
+
+                if let Some(best) = best_target {
+                    let bad_c = ci_c > 50.0;
+                    let bad_best = 3.89 * best.current_pos_uncertainty() > 50.0;
+
+                    if bad_best && !bad_c {
+                        best_target = Some(c);
+                    } else if !bad_best && bad_c {
+                        // Keep best, do nothing
+                    } else {
+                        let attempts_c = *self.fire_counts.get(&c.id).unwrap_or(&0);
+                        let attempts_best = *self.fire_counts.get(&best.id).unwrap_or(&0);
+                        if attempts_c < attempts_best {
+                            best_target = Some(c);
+                        } else if attempts_c == attempts_best {
+                            let best_sol = &solutions[&best.id];
+                            if self.is_better_target(c.id, sol, best.id, best_sol) {
+                                best_target = Some(c);
+                            }
+                        }
+                    }
+                } else {
+                    best_target = Some(c);
+                }
+            }
+            self.weapon_target = best_target.map(|c| c.id);
+            if self.weapon_target.is_some() {
+                self.shot_fired_at_current = false;
+            }
+        }
 
         if let Some(tid) = self.weapon_target {
             debug!("Selected target: {}", tid);
@@ -252,9 +266,13 @@ impl Ship {
             if let Some(c) = contacts.iter().find(|contact| contact.id == tid) {
                 let sol = &solutions[&tid];
                 if let (Some(time_to_impact), Some(_lead_dir), Some(p_e)) = (sol.time_to_impact, sol.lead_dir, sol.p_e) {
-                    let lead_angle = sol.target_angle;
-                    let target_omega = sol.target_omega;
-                    quick_turn_with_target_omega(lead_angle, target_omega);
+                    let torque_cmd = quick_turn_torque_kinematic(
+                        p_e,
+                        c.velocity_at(next_tick),
+                        c.acceleration,
+                        Vec2::new(0.0, 0.0),
+                    );
+                    torque(torque_cmd);
 
                     // Visualization
                     // Red: Predicted target position at impact if fired next turn
@@ -339,6 +357,7 @@ impl Ship {
 
                         fire(0);
                         *self.fire_counts.entry(actual_target_id).or_insert(0) += 1;
+                        self.shot_fired_at_current = true;
                         let expiry_tick = current_tick + collision_tick;
                         self.intercept_plots.push(ExpectedIntercept {
                             position: collision_pos,
@@ -358,9 +377,13 @@ impl Ship {
                         // debug!("Did not fire on target {}: {}", tid, reasons.join(", "));
                     }
                 } else {
-                    let direct_angle = sol.target_angle;
-                    let target_omega = sol.target_omega;
-                    quick_turn_with_target_omega(direct_angle, target_omega);
+                    let torque_cmd = quick_turn_torque_kinematic(
+                        c.position_at(next_tick),
+                        c.velocity_at(next_tick),
+                        c.acceleration,
+                        Vec2::new(0.0, 0.0),
+                    );
+                    torque(torque_cmd);
                     debug!("Did not fire on target {}: lead prediction failed", tid);
                     self.prev_intended_solution = None;
                 }

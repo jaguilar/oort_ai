@@ -1,6 +1,7 @@
 use oort_api::prelude::*;
-use crate::control::{quick_turn_with_target_omega, AngleTracker, MissileGuidance};
+use crate::control::{quick_turn_with_target_omega, AngleTracker, MissileGuidance, TargetTelemetry};
 use crate::radar::{RadarController, DefaultScanSliceGenerator};
+use crate::radio::SecureRadio;
 
 struct ExpectedIntercept {
     position: Vec2,
@@ -21,6 +22,7 @@ pub struct Ship {
     
     missile_launch_history: Vec<(u32, u32)>, // Tracks targets recently fired at by missiles: (target_id, tick_launched)
     seen_target_ids: Vec<u32>,
+    missile_radio: SecureRadio,
 }
 
 fn predict_lead_exact(
@@ -84,12 +86,14 @@ impl Ship {
         // Double the base scan range from 10000.0 to 20000.0
         rc.slice_generator = Box::new(DefaultScanSliceGenerator::new(0.6, 20000.0));
 
+        let missile_radio = SecureRadio::new(1337, 0);
+
         let mut mg = MissileGuidance::new();
         mg.target_channel = 3;
+        mg.secure_radio = Some(missile_radio);
 
-        // Pre-tune the cruiser's radio slot 0 to target channel 3 to avoid the 1-tick delay
-        select_radio(0);
-        set_radio_channel(mg.target_channel);
+        // Pre-tune the radio slot 0 for tick 0 to avoid the 1-tick delay
+        missile_radio.prepare_receive(0);
 
         Ship {
             radar_controller: rc,
@@ -102,6 +106,7 @@ impl Ship {
             broadcast_ticks: 0,
             missile_launch_history: Vec::new(),
             seen_target_ids: Vec::new(),
+            missile_radio,
         }
     }
 
@@ -365,12 +370,14 @@ impl Ship {
             }
         }
 
-        // Broadcast active target telemetry on channel 3
+        // Broadcast active target telemetry on SecureRadio
         if let Some(tid) = self.broadcast_target_id {
             if let Some(f) = fighters.iter().find(|fighter| fighter.id == tid) {
-                select_radio(0);
-                set_radio_channel(3);
-                send([f.current_position().x, f.current_position().y, f.current_velocity().x, f.current_velocity().y]);
+                let telemetry = TargetTelemetry {
+                    position: f.current_position(),
+                    velocity: f.current_velocity(),
+                };
+                self.missile_radio.transmit(0, telemetry.serialize());
             }
         }
 

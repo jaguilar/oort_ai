@@ -73,6 +73,215 @@ pub fn quick_turn_torque_with_target_omega_impl(
     }
 }
 
+/// A pure implementation of the kinematics-based quick turn torque controller using Newton's method.
+pub fn quick_turn_torque_kinematic_impl(
+    heading: f64,
+    omega: f64,
+    max_ang_accel: f64,
+    our_pos: Vec2,
+    our_vel: Vec2,
+    our_accel: Vec2,
+    target_pos: Vec2,
+    target_vel: Vec2,
+    target_accel: Vec2,
+) -> f64 {
+    // 1. Predict target relative state for the deadbeat control checks
+    let p_rel_next = target_pos - our_pos
+        + (target_vel - our_vel) * TICK_LENGTH
+        + 0.5 * (target_accel - our_accel) * TICK_LENGTH * (TICK_LENGTH + TICK_LENGTH);
+    let target_heading_next = p_rel_next.angle();
+    let r_len_sq_next = p_rel_next.dot(p_rel_next);
+    let target_omega_next = if r_len_sq_next > 1e-6 {
+        let v_rel_next = target_vel - our_vel + (target_accel - our_accel) * TICK_LENGTH;
+        (p_rel_next.x * v_rel_next.y - p_rel_next.y * v_rel_next.x) / r_len_sq_next
+    } else {
+        0.0
+    };
+
+    let difference = angle_diff(heading, target_heading_next - target_omega_next * TICK_LENGTH);
+    let unaccelerated_next_heading = heading + omega * TICK_LENGTH;
+    let diff_next = angle_diff(unaccelerated_next_heading, target_heading_next);
+    let omega_rel = omega - target_omega_next;
+
+    // 1-step deadbeat control when error is already zero (or extremely small)
+    if difference.abs() <= 1e-9 && omega_rel.abs() <= max_ang_accel * TICK_LENGTH {
+        return (-omega_rel / TICK_LENGTH).clamp(-max_ang_accel, max_ang_accel);
+    }
+
+    // 2-step deadbeat control
+    if difference.abs() <= max_ang_accel * TICK_LENGTH * TICK_LENGTH
+        && diff_next.abs() <= max_ang_accel * TICK_LENGTH * TICK_LENGTH
+    {
+        let alpha_req = diff_next / (TICK_LENGTH * TICK_LENGTH);
+        return alpha_req.clamp(-max_ang_accel, max_ang_accel);
+    }
+
+    // 2. Newton's root-finding method to find the optimal alignment time T
+    let s = if difference.abs() > 1e-9 {
+        difference.signum()
+    } else if omega_rel.abs() > 1e-9 {
+        -omega_rel.signum()
+    } else {
+        1.0
+    };
+
+    let target_heading_0 = (target_pos - our_pos).angle();
+    let r_len_sq_0 = (target_pos - our_pos).dot(target_pos - our_pos);
+    let init_diff = angle_diff(heading, target_heading_0);
+    let target_heading_0_unwrapped = heading + init_diff;
+
+    let target_omega_0 = if r_len_sq_0 > 1e-6 {
+        let v_rel_0 = target_vel - our_vel;
+        ((target_pos - our_pos).x * v_rel_0.y - (target_pos - our_pos).y * v_rel_0.x) / r_len_sq_0
+    } else {
+        0.0
+    };
+
+    let t0 = quick_turn_time_with_target_omega_pure(
+        heading,
+        omega,
+        max_ang_accel,
+        target_heading_0,
+        target_omega_0,
+    );
+
+    let cross = |a: Vec2, b: Vec2| a.x * b.y - a.y * b.x;
+
+    let f = |t_align: f64| {
+        let p_rel = target_pos - our_pos 
+            + (target_vel - our_vel) * t_align 
+            + 0.5 * (target_accel - our_accel) * t_align * (t_align + TICK_LENGTH);
+        let target_heading = p_rel.angle();
+        let target_heading_unwrapped = target_heading - 2.0 * std::f64::consts::PI * ((target_heading - target_heading_0_unwrapped) / (2.0 * std::f64::consts::PI)).round();
+        
+        let r_len_sq = p_rel.dot(p_rel);
+        let target_omega = if r_len_sq > 1e-6 {
+            let v_rel = target_vel - our_vel + (target_accel - our_accel) * t_align;
+            cross(p_rel, v_rel) / r_len_sq
+        } else {
+            0.0
+        };
+        
+        let t = 0.5 * (t_align + (target_omega - omega) / (s * max_ang_accel));
+        let theta_our = heading + omega * t_align + s * max_ang_accel * (2.0 * t * t_align - t * t - 0.5 * t_align * t_align + (t - 0.5 * t_align) * TICK_LENGTH);
+        
+        target_heading_unwrapped - theta_our
+    };
+
+    let df = |t_align: f64| {
+        let p_rel = target_pos - our_pos 
+            + (target_vel - our_vel) * t_align 
+            + 0.5 * (target_accel - our_accel) * t_align * (t_align + TICK_LENGTH);
+        let r_len_sq = p_rel.dot(p_rel);
+        
+        let (target_omega, alpha_target) = if r_len_sq > 1e-6 {
+            let v_rel = target_vel - our_vel + (target_accel - our_accel) * t_align;
+            let a_rel = target_accel - our_accel;
+            let omega_t = cross(p_rel, v_rel) / r_len_sq;
+            let alpha_t = (cross(p_rel, a_rel) - 2.0 * omega_t * p_rel.dot(v_rel)) / r_len_sq;
+            (omega_t, alpha_t)
+        } else {
+            (0.0, 0.0)
+        };
+        
+        let t = 0.5 * (t_align + (target_omega - omega) / (s * max_ang_accel));
+        let t_dec = t_align - t;
+        
+        -(s * max_ang_accel + alpha_target) * t_dec - 0.5 * alpha_target * TICK_LENGTH
+    };
+
+    let clamp = |t_align: f64| t_align.max(0.001);
+
+    // Solve for alignment time t_align using newton's method with step clamping
+    let mut x = t0;
+    let mut solved_t_align = t0;
+    for _iter in 0..30 {
+        x = clamp(x);
+        let fx = f(x);
+        if fx.abs() < 1e-4 {
+            solved_t_align = x;
+            break;
+        }
+        let dfx = df(x);
+        if dfx.abs() < 1e-12 {
+            solved_t_align = x;
+            break;
+        }
+        let step = (fx / dfx).clamp(-0.5, 0.5);
+        x -= step;
+        if step.abs() < 1e-4 {
+            solved_t_align = x;
+            break;
+        }
+        solved_t_align = x;
+    }
+    let t_align = clamp(solved_t_align);
+
+    // Compute the duration of the acceleration phase
+    let p_rel = target_pos - our_pos 
+        + (target_vel - our_vel) * t_align 
+        + 0.5 * (target_accel - our_accel) * t_align * (t_align + TICK_LENGTH);
+    let r_len_sq = p_rel.dot(p_rel);
+    let target_omega = if r_len_sq > 1e-6 {
+        let v_rel = target_vel - our_vel + (target_accel - our_accel) * t_align;
+        cross(p_rel, v_rel) / r_len_sq
+    } else {
+        0.0
+    };
+
+    let t = 0.5 * (t_align + (target_omega - omega) / (s * max_ang_accel));
+
+    let torque = if t > 0.0 {
+        s * max_ang_accel
+    } else {
+        -s * max_ang_accel
+    };
+
+    // To prevent rapid chattering/limit-cycles near the target angle and maintain smooth deadbeat handoff,
+    // we clamp the torque to deadbeat limits or smooth output when we are very close to alignment.
+    if difference.abs() > 0.002 {
+        torque
+    } else {
+        let k_p = 60.0;
+        let omega_target = k_p * difference + target_omega_0;
+        let torque_fallback = (omega_target - omega) / TICK_LENGTH;
+        torque_fallback.clamp(-max_ang_accel, max_ang_accel)
+    }
+}
+
+/// Calculates the clamped torque required to turn toward the target position using kinematics.
+pub fn quick_turn_torque_kinematic(
+    target_pos: Vec2,
+    target_vel: Vec2,
+    target_accel: Vec2,
+    our_accel: Vec2,
+) -> f64 {
+    // Transform target next-tick kinematics to target current-tick (t = 0) kinematics for the solver.
+    let target_pos_start = target_pos - target_vel * TICK_LENGTH;
+    let target_vel_start = target_vel - target_accel * TICK_LENGTH;
+    quick_turn_torque_kinematic_impl(
+        heading(),
+        angular_velocity(),
+        max_angular_acceleration(),
+        position(),
+        velocity(),
+        our_accel,
+        target_pos_start,
+        target_vel_start,
+        target_accel,
+    )
+}
+
+/// Turn at the maximum possible speed for a given ship that will not overshoot the target angle, using relative kinematics.
+pub fn quick_turn_kinematic(
+    target_pos: Vec2,
+    target_vel: Vec2,
+    target_accel: Vec2,
+    our_accel: Vec2,
+) {
+    torque(quick_turn_torque_kinematic(target_pos, target_vel, target_accel, our_accel));
+}
+
 
 
 /// Calculates the clamped torque required to turn toward the target angle without overshooting.
@@ -292,6 +501,35 @@ impl TargetTracker {
     }
 }
 
+/// Telemetry data for a tracked target, transmitted securely over radio.
+#[derive(Clone, Copy, Debug)]
+pub struct TargetTelemetry {
+    pub position: Vec2,
+    pub velocity: Vec2,
+}
+
+impl TargetTelemetry {
+    pub fn serialize(&self) -> [u8; 30] {
+        let mut payload = [0u8; 30];
+        payload[0..4].copy_from_slice(&(self.position.x as f32).to_le_bytes());
+        payload[4..8].copy_from_slice(&(self.position.y as f32).to_le_bytes());
+        payload[8..12].copy_from_slice(&(self.velocity.x as f32).to_le_bytes());
+        payload[12..16].copy_from_slice(&(self.velocity.y as f32).to_le_bytes());
+        payload
+    }
+
+    pub fn deserialize(payload: &[u8; 30]) -> Self {
+        let pos_x = f32::from_le_bytes(payload[0..4].try_into().unwrap()) as f64;
+        let pos_y = f32::from_le_bytes(payload[4..8].try_into().unwrap()) as f64;
+        let vel_x = f32::from_le_bytes(payload[8..12].try_into().unwrap()) as f64;
+        let vel_y = f32::from_le_bytes(payload[12..16].try_into().unwrap()) as f64;
+        TargetTelemetry {
+            position: vec2(pos_x, pos_y),
+            velocity: vec2(vel_x, vel_y),
+        }
+    }
+}
+
 /// Missile guidance system encapsulating radar scanning, target selection,
 /// proportional navigation, fuel economy, and terminal orientation control.
 pub struct MissileGuidance {
@@ -313,6 +551,7 @@ pub struct MissileGuidance {
     pub first_detection_tick: Option<u32>,
     pub target_channel: usize,
     pub radio_target_tracker: TargetTracker,
+    pub secure_radio: Option<crate::radio::SecureRadio>,
 }
 
 impl MissileGuidance {
@@ -343,35 +582,50 @@ impl MissileGuidance {
             first_detection_tick: None,
             target_channel: 3,
             radio_target_tracker: TargetTracker::new(),
+            secure_radio: None,
         }
     }
 
     pub fn tick(&mut self) {
-        // 1. Listen on the target radio channel
-        select_radio(0);
-        set_radio_channel(self.target_channel);
-
         let mut radio_ping = None;
 
-        // Try standard float message first ([f64; 4]: pos_x, pos_y, vel_x, vel_y)
-        if let Some(msg) = receive() {
-            let pos_x = msg[0];
-            let pos_y = msg[1];
-            let vel_x = msg[2];
-            let vel_y = msg[3];
-
-            // Mismatched byte representation when interpreted as f64 yields astronomical values or NaNs.
-            // Check that the numbers are finite and lie within reasonable limits to distinguish formats.
-            if pos_x.is_finite() && pos_y.is_finite() && vel_x.is_finite() && vel_y.is_finite()
-                && pos_x.abs() < 100_000.0 && pos_y.abs() < 100_000.0
-                && vel_x.abs() < 10_000.0 && vel_y.abs() < 10_000.0
-            {
-                let pos = vec2(pos_x, pos_y);
-                let vel = vec2(vel_x, vel_y);
-                self.radio_target_tracker.update(current_tick(), pos, vel);
+        if let Some(ref sr) = self.secure_radio {
+            // Secure radio mode
+            if let Some(payload) = sr.receive() {
+                let telemetry = TargetTelemetry::deserialize(&payload);
+                self.radio_target_tracker.update(current_tick(), telemetry.position, telemetry.velocity);
                 let accel = self.radio_target_tracker.acceleration();
-                debug!("Decoded radio float ping on channel {}: pos=({:.1}, {:.1}) vel=({:.1}, {:.1})", self.target_channel, pos.x, pos.y, vel.x, vel.y);
-                radio_ping = Some((pos, vel, accel));
+                debug!("Decoded secure radio ping: pos=({:.1}, {:.1}) vel=({:.1}, {:.1})", telemetry.position.x, telemetry.position.y, telemetry.velocity.x, telemetry.velocity.y);
+                radio_ping = Some((telemetry.position, telemetry.velocity, accel));
+            }
+            // Prepare for next tick
+            sr.prepare_receive(0);
+        } else {
+            // Standard radio mode
+            // 1. Listen on the target radio channel
+            select_radio(0);
+            set_radio_channel(self.target_channel);
+
+            // Try standard float message first ([f64; 4]: pos_x, pos_y, vel_x, vel_y)
+            if let Some(msg) = receive() {
+                let pos_x = msg[0];
+                let pos_y = msg[1];
+                let vel_x = msg[2];
+                let vel_y = msg[3];
+
+                // Mismatched byte representation when interpreted as f64 yields astronomical values or NaNs.
+                // Check that the numbers are finite and lie within reasonable limits to distinguish formats.
+                if pos_x.is_finite() && pos_y.is_finite() && vel_x.is_finite() && vel_y.is_finite()
+                    && pos_x.abs() < 100_000.0 && pos_y.abs() < 100_000.0
+                    && vel_x.abs() < 10_000.0 && vel_y.abs() < 10_000.0
+                {
+                    let pos = vec2(pos_x, pos_y);
+                    let vel = vec2(vel_x, vel_y);
+                    self.radio_target_tracker.update(current_tick(), pos, vel);
+                    let accel = self.radio_target_tracker.acceleration();
+                    debug!("Decoded radio float ping on channel {}: pos=({:.1}, {:.1}) vel=({:.1}, {:.1})", self.target_channel, pos.x, pos.y, vel.x, vel.y);
+                    radio_ping = Some((pos, vel, accel));
+                }
             }
         }
 
@@ -713,9 +967,26 @@ pub fn optimal_turn_torque(
 /// Estimates the time to complete a turn to face a target angle and match target angular velocity,
 /// assuming we use the quick_turn_torque_with_target_omega controller.
 pub fn quick_turn_time_with_target_omega(target_angle: f64, target_omega: f64) -> f64 {
-    let mut x0 = angle_diff(heading(), target_angle - target_omega * TICK_LENGTH);
-    let mut v0 = angular_velocity() - target_omega;
-    let a = max_angular_acceleration();
+    quick_turn_time_with_target_omega_pure(
+        heading(),
+        angular_velocity(),
+        max_angular_acceleration(),
+        target_angle,
+        target_omega,
+    )
+}
+
+/// A pure version of quick_turn_time_with_target_omega that does not call global functions.
+pub fn quick_turn_time_with_target_omega_pure(
+    heading: f64,
+    omega: f64,
+    max_ang_accel: f64,
+    target_angle: f64,
+    target_omega: f64,
+) -> f64 {
+    let mut x0 = angle_diff(heading, target_angle - target_omega * TICK_LENGTH);
+    let mut v0 = omega - target_omega;
+    let a = max_ang_accel;
     if a < 1e-6 {
         return f64::INFINITY;
     }
@@ -726,9 +997,9 @@ pub fn quick_turn_time_with_target_omega(target_angle: f64, target_omega: f64) -
     let theta_offset = theta_trans / 2.0;
 
     // Check if we are already aligned and matched within the 1-tick control window
-    let unaccelerated_next_heading = heading() + angular_velocity() * TICK_LENGTH;
+    let unaccelerated_next_heading = heading + omega * TICK_LENGTH;
     let diff_next = angle_diff(unaccelerated_next_heading, target_angle);
-    let speed_diff = (angular_velocity() - target_omega).abs();
+    let speed_diff = (omega - target_omega).abs();
     if diff_next.abs() <= a * TICK_LENGTH * TICK_LENGTH
         && speed_diff <= a * TICK_LENGTH
     {
@@ -839,8 +1110,10 @@ mod tests {
         diff
     }
 
-    #[test]
-    fn test_quick_turn_torque_simulation() {
+    fn run_simulation_test_cases<F>(torque_controller: F, name: &str)
+    where
+        F: Fn(f64, f64, f64, Vec2, Vec2, Vec2, Vec2, Vec2, Vec2, f64) -> f64,
+    {
         let mut lcg = Lcg::new(1337);
         let max_torque = 2.0 * std::f64::consts::PI;
         let max_accel = 60.0;
@@ -920,14 +1193,7 @@ mod tests {
 
             for tick in 0..max_ticks {
                 let r = t_pos - p_pos;
-                let v_rel = t_vel - p_vel;
                 let target_heading = r.angle();
-                let r_len_sq = r.dot(r);
-                let target_omega = if r_len_sq > 1e-6 {
-                    (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
-                } else {
-                    0.0
-                };
 
                 let heading_error = angle_diff_local(p_heading, target_heading);
 
@@ -959,13 +1225,24 @@ mod tests {
                     max_overshoot = max_overshoot.max(heading_error.abs());
                 }
 
-                let target_heading_next = target_heading + target_omega * dt;
-                let torque_cmd = quick_turn_torque_with_target_omega_impl(
+                // Player acceleration
+                let p_accel = match p_accel_mode {
+                    0 => Vec2::new(0.0, 0.0),
+                    1 => p_accel_const,
+                    _ => Vec2::new(max_accel * p_heading.cos(), max_accel * p_heading.sin()),
+                };
+
+                let torque_cmd = torque_controller(
                     p_heading,
                     p_omega,
                     max_torque,
-                    target_heading_next,
-                    target_omega,
+                    p_pos,
+                    p_vel,
+                    p_accel,
+                    t_pos,
+                    t_vel,
+                    t_accel,
+                    dt,
                 );
 
                 torques.push(torque_cmd);
@@ -975,11 +1252,6 @@ mod tests {
                 t_pos = t_pos + t_vel * dt;
 
                 // Update player physics
-                let p_accel = match p_accel_mode {
-                    0 => Vec2::new(0.0, 0.0),
-                    1 => p_accel_const,
-                    _ => Vec2::new(max_accel * p_heading.cos(), max_accel * p_heading.sin()),
-                };
                 p_vel = p_vel + p_accel * dt;
                 p_pos = p_pos + p_vel * dt;
 
@@ -1068,7 +1340,7 @@ mod tests {
             }
         }
 
-        println!("Successful test cases: {} / 1000", successes);
+        println!("Successful {} test cases: {} / 1000", name, successes);
         println!("Failures: {}, Max Torque Failures: {}, Overshoot Failures: {}, Convergence Failures: {}",
             failures, max_torque_failures, overshoot_failures, convergence_failures);
         
@@ -1077,12 +1349,14 @@ mod tests {
         }
 
         if failures > 0 {
-            panic!("Test failed: {} test cases failed the requirements.", failures);
+            panic!("{} test failed: {} test cases failed the requirements.", name, failures);
         }
     }
 
-    #[test]
-    fn test_quick_turn_torque_perpendicular_traversing() {
+    fn run_perpendicular_traversing_test<F>(torque_controller: F, name: &str)
+    where
+        F: Fn(f64, f64, f64, Vec2, Vec2, Vec2, Vec2, Vec2, Vec2, f64) -> f64,
+    {
         let mut lcg = Lcg::new(42);
         let max_torque = 2.0 * std::f64::consts::PI;
         let dt = 1.0 / 60.0;
@@ -1132,14 +1406,17 @@ mod tests {
                     turn_ticks = Some(tick - 9);
                 }
 
-                // Target next heading estimation for the torque controller
-                let target_heading_next = target_heading + target_omega * dt;
-                let torque_cmd = quick_turn_torque_with_target_omega_impl(
+                let torque_cmd = torque_controller(
                     p_heading,
                     p_omega,
                     max_torque,
-                    target_heading_next,
-                    target_omega,
+                    p_pos,
+                    Vec2::new(0.0, 0.0),
+                    Vec2::new(0.0, 0.0),
+                    t_pos,
+                    t_vel,
+                    Vec2::new(0.0, 0.0),
+                    dt,
                 );
 
                 // Update physics
@@ -1159,9 +1436,116 @@ mod tests {
             );
             let tt = turn_ticks.unwrap();
             println!(
-                "Case {}: Converged in {} ticks ({:.2}s). Init heading: {:.4} rad, speed: {:.1} m/s",
-                case_idx, tt, tt as f64 * dt, init_heading, speed
+                "Case {}: {} converged in {} ticks ({:.2}s). Init heading: {:.4} rad, speed: {:.1} m/s",
+                case_idx, name, tt, tt as f64 * dt, init_heading, speed
             );
         }
+    }
+
+    #[test]
+    fn test_quick_turn_torque_simulation() {
+        run_simulation_test_cases(
+            |p_heading, p_omega, max_torque, p_pos, p_vel, _p_accel, t_pos, t_vel, _t_accel, dt| {
+                let r = t_pos - p_pos;
+                let v_rel = t_vel - p_vel;
+                let target_heading = r.angle();
+                let r_len_sq = r.dot(r);
+                let target_omega = if r_len_sq > 1e-6 {
+                    (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
+                } else {
+                    0.0
+                };
+                let target_heading_next = target_heading + target_omega * dt;
+                quick_turn_torque_with_target_omega_impl(
+                    p_heading,
+                    p_omega,
+                    max_torque,
+                    target_heading_next,
+                    target_omega,
+                )
+            },
+            "Target Omega Simulation",
+        );
+    }
+
+    #[test]
+    fn test_quick_turn_torque_kinematic_simulation() {
+        run_simulation_test_cases(
+            |p_heading, p_omega, max_torque, p_pos, p_vel, p_accel, t_pos, t_vel, t_accel, _dt| {
+                quick_turn_torque_kinematic_impl(
+                    p_heading,
+                    p_omega,
+                    max_torque,
+                    p_pos,
+                    p_vel,
+                    p_accel,
+                    t_pos,
+                    t_vel,
+                    t_accel,
+                )
+            },
+            "Kinematic Simulation",
+        );
+    }
+
+    #[test]
+    fn test_quick_turn_torque_perpendicular_traversing() {
+        run_perpendicular_traversing_test(
+            |p_heading, p_omega, max_torque, p_pos, p_vel, _p_accel, t_pos, t_vel, _t_accel, dt| {
+                let r = t_pos - p_pos;
+                let v_rel = t_vel - p_vel;
+                let target_heading = r.angle();
+                let r_len_sq = r.dot(r);
+                let target_omega = if r_len_sq > 1e-6 {
+                    (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
+                } else {
+                    0.0
+                };
+                let target_heading_next = target_heading + target_omega * dt;
+                quick_turn_torque_with_target_omega_impl(
+                    p_heading,
+                    p_omega,
+                    max_torque,
+                    target_heading_next,
+                    target_omega,
+                )
+            },
+            "Target Omega Perpendicular Traversing",
+        );
+    }
+
+    #[test]
+    fn test_quick_turn_torque_kinematic_perpendicular_traversing() {
+        run_perpendicular_traversing_test(
+            |p_heading, p_omega, max_torque, p_pos, p_vel, p_accel, t_pos, t_vel, t_accel, _dt| {
+                quick_turn_torque_kinematic_impl(
+                    p_heading,
+                    p_omega,
+                    max_torque,
+                    p_pos,
+                    p_vel,
+                    p_accel,
+                    t_pos,
+                    t_vel,
+                    t_accel,
+                )
+            },
+            "Kinematic Perpendicular Traversing",
+        );
+    }
+
+    #[test]
+    fn test_target_telemetry_serialization() {
+        let telemetry = TargetTelemetry {
+            position: vec2(12345.67, -9876.54),
+            velocity: vec2(-456.78, 987.65),
+        };
+        let payload = telemetry.serialize();
+        let deserialized = TargetTelemetry::deserialize(&payload);
+        
+        assert!((telemetry.position.x - deserialized.position.x).abs() < 1e-1);
+        assert!((telemetry.position.y - deserialized.position.y).abs() < 1e-1);
+        assert!((telemetry.velocity.x - deserialized.velocity.x).abs() < 1e-2);
+        assert!((telemetry.velocity.y - deserialized.velocity.y).abs() < 1e-2);
     }
 }
