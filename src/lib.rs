@@ -11,4 +11,5 @@ pub mod tutorial_squadron;
 pub mod tutorial_frigate;
 pub mod tutorial_cruiser;
 pub mod mission_gunnery;
+pub mod mission_cruiser_defense;
 

@@ -18,9 +18,27 @@ pub struct Contact {
     pub tracking_retry_count: u32,
     pub confirmation_attempts: u32,
     pub confusing_contact: Option<u32>,
+    pub p_cov_x: [[f64; 3]; 3],
+    pub p_cov_y: [[f64; 3]; 3],
 }
 
 impl Contact {
+    pub fn initial_cov(pos_unc: f64, vel_unc: f64, class: Class) -> [[f64; 3]; 3] {
+        let stats = class.default_stats();
+        let mut max_acc = stats.max_forward_acceleration
+            .max(stats.max_backward_acceleration)
+            .max(stats.max_lateral_acceleration);
+        if class == Class::Fighter || class == Class::Missile {
+            max_acc += 100.0;
+        }
+        let sigma_a = max_acc;
+        [
+            [pos_unc.powi(2), 0.0, 0.0],
+            [0.0, vel_unc.powi(2), 0.0],
+            [0.0, 0.0, sigma_a.powi(2)],
+        ]
+    }
+
     pub fn position_at(&self, tick: u32) -> Vec2 {
         let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
         self.position + self.velocity * dt + 0.5 * self.acceleration * dt * (dt + TICK_LENGTH)
@@ -33,7 +51,39 @@ impl Contact {
 
     pub fn pos_uncertainty_at(&self, tick: u32) -> f64 {
         let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
-        self.pos_uncertainty + self.vel_uncertainty * dt
+        if dt <= 0.0 {
+            return self.pos_uncertainty;
+        }
+        let f02 = 0.5 * dt * (dt + TICK_LENGTH);
+        
+        let var_pred_x = self.p_cov_x[0][0] 
+            + 2.0 * dt * self.p_cov_x[0][1] 
+            + 2.0 * f02 * self.p_cov_x[0][2] 
+            + dt.powi(2) * self.p_cov_x[1][1] 
+            + 2.0 * dt * f02 * self.p_cov_x[1][2] 
+            + f02.powi(2) * self.p_cov_x[2][2];
+
+        let var_pred_y = self.p_cov_y[0][0] 
+            + 2.0 * dt * self.p_cov_y[0][1] 
+            + 2.0 * f02 * self.p_cov_y[0][2] 
+            + dt.powi(2) * self.p_cov_y[1][1] 
+            + 2.0 * dt * f02 * self.p_cov_y[1][2] 
+            + f02.powi(2) * self.p_cov_y[2][2];
+
+        // Process noise
+        let stats = self.class.default_stats();
+        let mut max_acc = stats.max_forward_acceleration
+            .max(stats.max_backward_acceleration)
+            .max(stats.max_lateral_acceleration);
+        if self.class == Class::Fighter || self.class == Class::Missile {
+            max_acc += 100.0;
+        }
+        let s = (0.5 * max_acc).powi(2);
+        let q00 = s * dt.powi(5) / 20.0;
+
+        let unc_x = (var_pred_x + q00).max(0.0).sqrt();
+        let unc_y = (var_pred_y + q00).max(0.0).sqrt();
+        unc_x.max(unc_y)
     }
 
     pub fn current_position(&self) -> Vec2 {
@@ -46,6 +96,143 @@ impl Contact {
 
     pub fn current_pos_uncertainty(&self) -> f64 {
         self.pos_uncertainty_at(current_tick())
+    }
+
+    pub fn predict_and_update(&mut self, current_t: u32, z_pos: Vec2, z_vel: Vec2, sigma_p: f64, sigma_v: f64) {
+        let dt = (current_t - self.last_scanned) as f64 * TICK_LENGTH;
+        if dt <= 0.0 {
+            return;
+        }
+
+        // Get process noise jerk spectral density S
+        let stats = self.class.default_stats();
+        let mut max_acc = stats.max_forward_acceleration
+            .max(stats.max_backward_acceleration)
+            .max(stats.max_lateral_acceleration);
+        if self.class == Class::Fighter || self.class == Class::Missile {
+            max_acc += 100.0;
+        }
+        let s = (0.5 * max_acc).powi(2);
+
+        // Precompute transition matrix components for F(dt)
+        let f02 = 0.5 * dt * (dt + TICK_LENGTH);
+
+        // Process noise matrix Q(dt)
+        let q00 = s * dt.powi(5) / 20.0;
+        let q01 = s * dt.powi(4) / 8.0;
+        let q02 = s * dt.powi(3) / 6.0;
+        let q11 = s * dt.powi(3) / 3.0;
+        let q12 = s * dt.powi(2) / 2.0;
+        let q22 = s * dt;
+
+        // Perform prediction and update for both X and Y
+        let (pos_x, vel_x, acc_x, cov_x) = self.predict_and_update_dim(
+            self.position.x, self.velocity.x, self.acceleration.x, self.p_cov_x,
+            dt, f02, q00, q01, q02, q11, q12, q22,
+            z_pos.x, z_vel.x, sigma_p, sigma_v
+        );
+
+        let (pos_y, vel_y, acc_y, cov_y) = self.predict_and_update_dim(
+            self.position.y, self.velocity.y, self.acceleration.y, self.p_cov_y,
+            dt, f02, q00, q01, q02, q11, q12, q22,
+            z_pos.y, z_vel.y, sigma_p, sigma_v
+        );
+
+        // Save back
+        self.position = Vec2::new(pos_x, pos_y);
+        self.velocity = Vec2::new(vel_x, vel_y);
+        self.acceleration = Vec2::new(acc_x, acc_y);
+        self.p_cov_x = cov_x;
+        self.p_cov_y = cov_y;
+        self.last_scanned = current_t;
+        self.pos_uncertainty = self.p_cov_x[0][0].sqrt().max(self.p_cov_y[0][0].sqrt());
+        self.vel_uncertainty = self.p_cov_x[1][1].sqrt().max(self.p_cov_y[1][1].sqrt());
+    }
+
+    fn predict_and_update_dim(
+        &self,
+        pos: f64, vel: f64, acc: f64, p: [[f64; 3]; 3],
+        dt: f64, f02: f64,
+        q00: f64, q01: f64, q02: f64, q11: f64, q12: f64, q22: f64,
+        z_pos: f64, z_vel: f64, sigma_p: f64, sigma_v: f64
+    ) -> (f64, f64, f64, [[f64; 3]; 3]) {
+        // 1. Predict state
+        let pos_pred = pos + vel * dt + f02 * acc;
+        let vel_pred = vel + acc * dt;
+        let acc_pred = acc;
+
+        // 2. Predict covariance: P_pred = F * P * F^T + Q
+        let fp00 = p[0][0] + dt * p[0][1] + f02 * p[0][2];
+        let fp01 = p[0][1] + dt * p[1][1] + f02 * p[1][2];
+        let fp02 = p[0][2] + dt * p[1][2] + f02 * p[2][2];
+        let fp10 = p[0][1] + dt * p[0][2];
+        let fp11 = p[1][1] + dt * p[1][2];
+        let fp12 = p[1][2] + dt * p[2][2];
+        let fp20 = p[0][2];
+        let fp21 = p[1][2];
+        let fp22 = p[2][2];
+
+        let mut p_pred = [[0.0; 3]; 3];
+        p_pred[0][0] = fp00 + dt * fp01 + f02 * fp02 + q00;
+        p_pred[0][1] = fp01 + dt * fp02 + q01;
+        p_pred[0][2] = fp02 + q02;
+        p_pred[1][0] = fp10 + dt * fp11 + f02 * fp12 + q01;
+        p_pred[1][1] = fp11 + dt * fp12 + q11;
+        p_pred[1][2] = fp12 + q12;
+        p_pred[2][0] = fp20 + dt * fp21 + f02 * fp22 + q02;
+        p_pred[2][1] = fp21 + dt * fp22 + q12;
+        p_pred[2][2] = fp22 + q22;
+
+        // Enforce symmetry
+        p_pred[1][0] = p_pred[0][1];
+        p_pred[2][0] = p_pred[0][2];
+        p_pred[2][1] = p_pred[1][2];
+
+        // 3. Kalman Gain Update
+        let r_p = sigma_p.powi(2);
+        let r_v = sigma_v.powi(2);
+        
+        let d = (p_pred[0][0] + r_p) * (p_pred[1][1] + r_v) - p_pred[0][1].powi(2);
+        if d.abs() < 1e-12 {
+            return (pos_pred, vel_pred, acc_pred, p_pred);
+        }
+
+        let k00 = (p_pred[0][0] * (p_pred[1][1] + r_v) - p_pred[0][1].powi(2)) / d;
+        let k01 = (p_pred[0][1] * r_p) / d;
+        let k10 = (p_pred[0][1] * r_v) / d;
+        let k11 = (p_pred[1][1] * (p_pred[0][0] + r_p) - p_pred[0][1].powi(2)) / d;
+        let k20 = (p_pred[0][2] * (p_pred[1][1] + r_v) - p_pred[1][2] * p_pred[0][1]) / d;
+        let k21 = (p_pred[1][2] * (p_pred[0][0] + r_p) - p_pred[0][2] * p_pred[0][1]) / d;
+
+        // 4. Update State
+        let y_p = z_pos - pos_pred;
+        let y_v = z_vel - vel_pred;
+
+        let pos_new = pos_pred + k00 * y_p + k01 * y_v;
+        let vel_new = vel_pred + k10 * y_p + k11 * y_v;
+        let acc_new = acc_pred + k20 * y_p + k21 * y_v;
+
+        // 5. Update Covariance: P_new = (I - K*H)*P_pred
+        let mut p_new = [[0.0; 3]; 3];
+        p_new[0][0] = (1.0 - k00) * p_pred[0][0] - k01 * p_pred[0][1];
+        p_new[0][1] = (1.0 - k00) * p_pred[0][1] - k01 * p_pred[1][1];
+        p_new[0][2] = (1.0 - k00) * p_pred[0][2] - k01 * p_pred[1][2];
+
+        p_new[1][1] = -k10 * p_pred[0][1] + (1.0 - k11) * p_pred[1][1];
+        p_new[1][2] = -k10 * p_pred[0][2] + (1.0 - k11) * p_pred[1][2];
+
+        p_new[2][2] = -k20 * p_pred[0][2] - k21 * p_pred[1][2] + p_pred[2][2];
+
+        // Enforce symmetry and positive semi-definiteness on diagonal
+        p_new[1][0] = p_new[0][1];
+        p_new[2][0] = p_new[0][2];
+        p_new[2][1] = p_new[1][2];
+
+        p_new[0][0] = p_new[0][0].max(0.0);
+        p_new[1][1] = p_new[1][1].max(0.0);
+        p_new[2][2] = p_new[2][2].max(0.0);
+
+        (pos_new, vel_new, acc_new, p_new)
     }
 }
 
@@ -234,26 +421,16 @@ impl RadarController {
                             debug!("Scan hit for contact {} was outside 99.99% CI and moved position by {:.1}m (>20m), associated due to dynamic gating fallback ({:.1}m based on max accel {:.1}m/s^2 and dt={:.3}s)", contact.id, best_dist, fallback, max_acc, dt_sec);
                         }
 
-                        let dt = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
                         let error_factor = 10.0f64.powf(-c.snr / 10.0);
                         let dist = position().distance(c.position);
                         let sigma_r = 10000.0 * error_factor;
                         let sigma_theta = (10.0 * (TAU / 360.0)) * error_factor;
                         let pos_unc = sigma_r.max(dist * sigma_theta.min(radar_width() / 2.0));
+                        let vel_unc = 100.0 * error_factor;
 
-                        if dt > 0.0 {
-                            let last_scanned_vel = contact.velocity;
-                            let raw_accel = (c.velocity - last_scanned_vel) / dt;
-                            let alpha = if 3.89 * pos_unc < 10.0 { 1.0 } else { 0.5 };
-                            contact.acceleration = alpha * raw_accel + (1.0 - alpha) * contact.acceleration;
-                        }
-                        contact.position = c.position;
-                        contact.velocity = c.velocity;
-                        contact.last_scanned = current_t;
+                        contact.predict_and_update(current_t, c.position, c.velocity, pos_unc, vel_unc);
                         contact.rssi = c.rssi;
                         contact.snr = c.snr;
-                        contact.pos_uncertainty = pos_unc;
-                        contact.vel_uncertainty = 100.0 * error_factor;
                         contact.radar_locked = true;
                         contact.tracking_retry_count = 0;
                     } else {
@@ -265,6 +442,8 @@ impl RadarController {
                         let vel_unc = 100.0 * error_factor;
 
                         let last_scanned = current_t;
+                        let cov_x = Contact::initial_cov(pos_unc, vel_unc, c.class);
+                        let cov_y = Contact::initial_cov(pos_unc, vel_unc, c.class);
 
                         self.contacts.push(Contact {
                             id: self.next_contact_id,
@@ -282,6 +461,8 @@ impl RadarController {
                             tracking_retry_count: 0,
                             confirmation_attempts: 0,
                             confusing_contact: None,
+                            p_cov_x: cov_x,
+                            p_cov_y: cov_y,
                         });
                         self.next_contact_id += 1;
                     }
@@ -330,26 +511,16 @@ impl RadarController {
                                 debug!("Tracked scan hit associated to contact {} was outside 99.99% CI and moved position by {:.1}m (>20m), associated due to dynamic gating fallback ({:.1}m based on max accel {:.1}m/s^2 and dt={:.3}s)", contact.id, best_dist, fallback, max_acc, dt_sec);
                             }
 
-                            let dt = (current_t - contact.last_scanned) as f64 * TICK_LENGTH;
                             let error_factor = 10.0f64.powf(-c.snr / 10.0);
                             let dist = position().distance(c.position);
                             let sigma_r = 10000.0 * error_factor;
                             let sigma_theta = (10.0 * (TAU / 360.0)) * error_factor;
                             let pos_unc = sigma_r.max(dist * sigma_theta.min(radar_width() / 2.0));
+                            let vel_unc = 100.0 * error_factor;
 
-                            if dt > 0.0 {
-                                let last_scanned_vel = contact.velocity;
-                                let raw_accel = (c.velocity - last_scanned_vel) / dt;
-                                let alpha = if 3.89 * pos_unc < 10.0 { 1.0 } else { 0.5 };
-                                contact.acceleration = alpha * raw_accel + (1.0 - alpha) * contact.acceleration;
-                            }
-                            contact.position = c.position;
-                            contact.velocity = c.velocity;
-                            contact.last_scanned = current_t;
+                            contact.predict_and_update(current_t, c.position, c.velocity, pos_unc, vel_unc);
                             contact.rssi = c.rssi;
                             contact.snr = c.snr;
-                            contact.pos_uncertainty = pos_unc;
-                            contact.vel_uncertainty = 100.0 * error_factor;
                             contact.radar_locked = true;
                             contact.tracking_retry_count = 0;
                         }
@@ -437,6 +608,9 @@ impl RadarController {
                         let vel_unc = 100.0 * error_factor;
                         let last_scanned = current_t;
 
+                        let cov_x = Contact::initial_cov(pos_unc, vel_unc, c.class);
+                        let cov_y = Contact::initial_cov(pos_unc, vel_unc, c.class);
+
                         self.contacts.push(Contact {
                             id: self.next_contact_id,
                             class: c.class,
@@ -453,6 +627,8 @@ impl RadarController {
                             tracking_retry_count: 0,
                             confirmation_attempts: 0,
                             confusing_contact: None,
+                            p_cov_x: cov_x,
+                            p_cov_y: cov_y,
                         });
                         self.next_contact_id += 1;
                     }
@@ -729,6 +905,8 @@ impl RadarController {
                 contact.pos_uncertainty = 10.0;
                 contact.vel_uncertainty = 5.0;
                 contact.tracking_retry_count = 0;
+                contact.p_cov_x = Contact::initial_cov(10.0, 5.0, contact.class);
+                contact.p_cov_y = Contact::initial_cov(10.0, 5.0, contact.class);
                 found_id = Some(id);
             }
         }
@@ -745,6 +923,8 @@ impl RadarController {
                     contact.pos_uncertainty = 10.0;
                     contact.vel_uncertainty = 5.0;
                     contact.tracking_retry_count = 0;
+                    contact.p_cov_x = Contact::initial_cov(10.0, 5.0, contact.class);
+                    contact.p_cov_y = Contact::initial_cov(10.0, 5.0, contact.class);
                     found_id = Some(contact.id);
                     break;
                 }
@@ -756,6 +936,8 @@ impl RadarController {
         } else if let Some(id) = existing_id {
             // Recreate deleted contact using its existing ID
             let last_scanned = current_t;
+            let cov_x = Contact::initial_cov(10.0, 5.0, Class::Fighter);
+            let cov_y = Contact::initial_cov(10.0, 5.0, Class::Fighter);
             self.contacts.push(Contact {
                 id,
                 class: Class::Fighter,
@@ -772,11 +954,15 @@ impl RadarController {
                 tracking_retry_count: 0,
                 confirmation_attempts: 0,
                 confusing_contact: None,
+                p_cov_x: cov_x,
+                p_cov_y: cov_y,
             });
             id
         } else {
             let id = self.next_contact_id;
             let last_scanned = current_t;
+            let cov_x = Contact::initial_cov(10.0, 5.0, Class::Fighter);
+            let cov_y = Contact::initial_cov(10.0, 5.0, Class::Fighter);
             self.contacts.push(Contact {
                 id,
                 class: Class::Fighter,
@@ -793,6 +979,8 @@ impl RadarController {
                 tracking_retry_count: 0,
                 confirmation_attempts: 0,
                 confusing_contact: None,
+                p_cov_x: cov_x,
+                p_cov_y: cov_y,
             });
             self.next_contact_id += 1;
             id
@@ -827,3 +1015,74 @@ impl RadarController {
         contact_id
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kalman_filter() {
+        let mut contact = Contact {
+            id: 0,
+            class: Class::Fighter,
+            position: Vec2::new(0.0, 0.0),
+            velocity: Vec2::new(10.0, 0.0),
+            acceleration: Vec2::new(0.0, 0.0),
+            last_scanned: 0,
+            rssi: 0.0,
+            snr: 30.0,
+            pos_uncertainty: 20.0,
+            vel_uncertainty: 10.0,
+            radar_locked: true,
+            provisional: false,
+            tracking_retry_count: 0,
+            confirmation_attempts: 0,
+            confusing_contact: None,
+            p_cov_x: Contact::initial_cov(20.0, 10.0, Class::Fighter),
+            p_cov_y: Contact::initial_cov(20.0, 10.0, Class::Fighter),
+        };
+
+        // Check initial covariance properties
+        assert!(contact.p_cov_x[0][0] > 0.0);
+        assert!(contact.p_cov_x[1][1] > 0.0);
+        assert!(contact.p_cov_x[2][2] > 0.0);
+        assert_eq!(contact.p_cov_x[0][1], 0.0);
+
+        // Run a simulation of 10 ticks (approx 0.16 seconds)
+        let mut t = 0;
+        let sigma_p = 10.0;
+        let sigma_v = 5.0;
+
+        for _ in 0..10 {
+            t += 1;
+            let dt = TICK_LENGTH;
+            let true_pos = Vec2::new(10.0 * (t as f64) * dt, 0.0);
+            let true_vel = Vec2::new(10.0, 0.0);
+
+            // Add simple alternating noise to make it noisy but zero-mean
+            let noise_sign = if t % 2 == 0 { 1.0 } else { -1.0 };
+            let meas_pos = true_pos + Vec2::new(noise_sign * sigma_p, 0.0);
+            let meas_vel = true_vel + Vec2::new(-noise_sign * sigma_v, 0.0);
+
+            contact.predict_and_update(t, meas_pos, meas_vel, sigma_p, sigma_v);
+
+            // Check that matrix symmetry is preserved
+            assert!((contact.p_cov_x[0][1] - contact.p_cov_x[1][0]).abs() < 1e-9);
+            assert!((contact.p_cov_x[0][2] - contact.p_cov_x[2][0]).abs() < 1e-9);
+            assert!((contact.p_cov_x[1][2] - contact.p_cov_x[2][1]).abs() < 1e-9);
+            assert!((contact.p_cov_y[0][1] - contact.p_cov_y[1][0]).abs() < 1e-9);
+            assert!((contact.p_cov_y[0][2] - contact.p_cov_y[2][0]).abs() < 1e-9);
+            assert!((contact.p_cov_y[1][2] - contact.p_cov_y[2][1]).abs() < 1e-9);
+
+            // Diagonals must remain positive
+            assert!(contact.p_cov_x[0][0] >= 0.0);
+            assert!(contact.p_cov_x[1][1] >= 0.0);
+            assert!(contact.p_cov_x[2][2] >= 0.0);
+        }
+
+        // Verify that the final uncertainty is smaller than the initial, showing integration
+        let final_pos_unc = contact.pos_uncertainty_at(t);
+        assert!(final_pos_unc < 20.0, "Position uncertainty did not decrease! final={}", final_pos_unc);
+    }
+}
+

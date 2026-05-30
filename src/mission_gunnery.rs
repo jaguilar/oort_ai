@@ -1,74 +1,34 @@
 use std::collections::HashMap;
 use oort_api::prelude::*;
-use crate::control::{quick_turn_with_target_omega, AngleTracker, quick_turn_time_with_target_omega, predict_lead};
-use crate::radar::{RadarController, DefaultScanSliceGenerator, ScanSliceGenerator, ScanSlice, Contact};
+use crate::control::{quick_turn_with_target_omega, quick_turn_time_with_target_omega, predict_lead, format_sig_figs};
+use crate::radar::{RadarController, ScanSliceGenerator, ScanSlice, Contact};
 
 struct ExpectedIntercept {
     position: Vec2,
     expiry_tick: u32,
 }
 
+struct IntendedSolution {
+    target_id: u32,
+    aim_point: Vec2,
+    time_to_impact: f64,
+}
+
+struct FiringSolution {
+    time_to_impact: Option<f64>,
+    lead_dir: Option<Vec2>,
+    target_angle: f64,
+    target_omega: f64,
+    aim_point_y: f64,
+    p_e: Option<Vec2>,
+}
+
 pub struct Ship {
     radar_controller: RadarController,
     weapon_target: Option<u32>,        // Target assigned to Gun 0
-    angle_tracker: AngleTracker,       // Tracks Gun 0 target angle rate for ship orientation
     intercept_plots: Vec<ExpectedIntercept>, // Intercept points to draw for active bullets
     fire_counts: HashMap<u32, u32>,    // Tracks count of shots fired on each target ID
-}
-
-fn predict_lead_exact(
-    gun_pos: Vec2,
-    our_vel: Vec2,
-    bullet_speed: f64,
-    target_pos: Vec2,
-    target_vel: Vec2,
-    target_accel: Vec2,
-) -> Option<(f64, Vec2)> {
-    let dp0 = target_pos - gun_pos;
-    let r_len = dp0.length();
-    if r_len < 1e-6 {
-        return None;
-    }
-    let dv = target_vel - our_vel;
-    let v_c = -dv.dot(dp0) / r_len;
-    let t0 = r_len / (bullet_speed + v_c.max(0.0));
-
-    let f = |t: f64| {
-        let p_e = target_pos + t * target_vel + 0.5 * target_accel * t * (t + TICK_LENGTH);
-        let d = p_e - gun_pos - t * our_vel;
-        d.length() - bullet_speed * t
-    };
-
-    let df = |t: f64| {
-        let p_e = target_pos + t * target_vel + 0.5 * target_accel * t * (t + TICK_LENGTH);
-        let d = p_e - gun_pos - t * our_vel;
-        let d_len = d.length();
-        let d_prime = target_vel + target_accel * (t + 0.5 * TICK_LENGTH) - our_vel;
-        if d_len > 1e-6 {
-            d.dot(d_prime) / d_len - bullet_speed
-        } else {
-            -bullet_speed
-        }
-    };
-
-    let clamp = |t: f64| {
-        if t < 0.0 {
-            0.0
-        } else {
-            t
-        }
-    };
-
-    if let Some(t) = crate::control::newton_solve(t0, f, df, clamp, 20, 1e-4) {
-        if t >= 0.0 {
-            let p_e = target_pos + t * target_vel + 0.5 * target_accel * t * (t + TICK_LENGTH);
-            let d = p_e - gun_pos - t * our_vel;
-            if d.length() > 0.0 {
-                return Some((t, d.normalize()));
-            }
-        }
-    }
-    None
+    prev_intended_solution: Option<IntendedSolution>,
 }
 
 pub struct GunneryScanSliceGenerator {
@@ -142,84 +102,31 @@ impl Ship {
         Ship {
             radar_controller: rc,
             weapon_target: None,
-            angle_tracker: AngleTracker::new(5.0),
             intercept_plots: Vec::new(),
             fire_counts: HashMap::new(),
+            prev_intended_solution: None,
         }
     }
 
-    fn target_aim_time(&self, c: &crate::radar::Contact) -> f64 {
-        let gun0_offset = Vec2::new(40.0, 0.0);
-        let gun0_pos = position() + gun0_offset.rotate(heading());
-        const GUN0_BULLET_SPEED: f64 = 4000.0;
-
-        let (target_angle, target_omega) = if let Some((_, lead_dir)) = predict_lead(
-            gun0_pos,
-            velocity(),
-            GUN0_BULLET_SPEED,
-            c.current_position(),
-            c.current_velocity(),
-            c.acceleration,
-        ) {
-            let target_angle = lead_dir.angle();
-            let r = c.current_position() - position();
-            let v_rel = c.current_velocity() - velocity();
-            let r_len_sq = r.dot(r);
-            let target_omega = if r_len_sq > 1e-6 {
-                (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
-            } else {
-                0.0
-            };
-            (target_angle, target_omega)
-        } else {
-            let r = c.current_position() - position();
-            let v_rel = c.current_velocity() - velocity();
-            let target_angle = r.angle();
-            let r_len_sq = r.dot(r);
-            let target_omega = if r_len_sq > 1e-6 {
-                (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
-            } else {
-                0.0
-            };
-            (target_angle, target_omega)
-        };
-
-        quick_turn_time_with_target_omega(target_angle, target_omega)
+    fn target_aim_time(&self, sol: &FiringSolution) -> f64 {
+        quick_turn_time_with_target_omega(sol.target_angle, sol.target_omega)
     }
 
-    fn target_firing_solution_y(&self, c: &crate::radar::Contact) -> f64 {
-        let gun0_offset = Vec2::new(40.0, 0.0);
-        let gun0_pos = position() + gun0_offset.rotate(heading());
-        const GUN0_BULLET_SPEED: f64 = 4000.0;
 
-        if let Some((t, _)) = predict_lead(
-            gun0_pos,
-            velocity(),
-            GUN0_BULLET_SPEED,
-            c.current_position(),
-            c.current_velocity(),
-            c.acceleration,
-        ) {
-            let p_e = c.position_at(current_tick() + (t / TICK_LENGTH).round() as u32);
-            p_e.y
-        } else {
-            c.current_position().y
-        }
-    }
-
-    fn is_better_target(&self, a: &crate::radar::Contact, b: &crate::radar::Contact) -> bool {
-        let y_a = self.target_firing_solution_y(a);
-        let y_b = self.target_firing_solution_y(b);
+    fn is_better_target(&self, id_a: u32, sol_a: &FiringSolution, id_b: u32, sol_b: &FiringSolution) -> bool {
+        let y_a = sol_a.aim_point_y;
+        let y_b = sol_b.aim_point_y;
 
         // Hysteresis: apply a bonus to the currently tracked target's Y value
         let hysteresis_bonus = 500.0; // in meters
-        let y_a_adj = y_a + if Some(a.id) == self.weapon_target { hysteresis_bonus } else { 0.0 };
-        let y_b_adj = y_b + if Some(b.id) == self.weapon_target { hysteresis_bonus } else { 0.0 };
+        let y_a_adj = y_a + if Some(id_a) == self.weapon_target { hysteresis_bonus } else { 0.0 };
+        let y_b_adj = y_b + if Some(id_b) == self.weapon_target { hysteresis_bonus } else { 0.0 };
 
         y_a_adj > y_b_adj
     }
 
     pub fn tick(&mut self) {
+        debug!("Current heading: {}", format_sig_figs(heading(), 6));
         let current_tick = current_tick();
 
         // 1. Update priority targets list based on weapon targeting (always mark current target as high priority)
@@ -235,13 +142,75 @@ impl Ship {
         // 3. Fetch active contacts from the radar controller
         let contacts = self.radar_controller.contacts();
 
+        // Precompute firing solutions for all active contacts once per tick (for a bullet fired NEXT turn)
+        let gun0_offset = Vec2::new(40.0, 0.0);
+        let gun0_pos = position() + gun0_offset.rotate(heading());
+        let next_tick = current_tick + 1;
+        let next_heading_approx = heading() + angular_velocity() * TICK_LENGTH;
+        let next_gun0_pos = position() + velocity() * TICK_LENGTH + gun0_offset.rotate(next_heading_approx);
+        const GUN0_BULLET_SPEED: f64 = 4000.0;
+        let mut solutions = HashMap::new();
+
+        for c in contacts {
+            let res = predict_lead(
+                next_gun0_pos,
+                velocity(),
+                GUN0_BULLET_SPEED,
+                c.position_at(next_tick),
+                c.velocity_at(next_tick),
+                c.acceleration,
+            );
+            
+            let v_rel = c.velocity_at(next_tick) - velocity();
+
+            let sol = if let Some((time_to_impact, lead_dir)) = res {
+                let p_e = c.position_at(next_tick + (time_to_impact / TICK_LENGTH).round() as u32);
+                let target_angle = lead_dir.angle();
+                let r = p_e - next_gun0_pos;
+                let r_len_sq = r.dot(r);
+                let target_omega = if r_len_sq > 1e-6 {
+                    (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
+                } else {
+                    0.0
+                };
+                FiringSolution {
+                    time_to_impact: Some(time_to_impact),
+                    lead_dir: Some(lead_dir),
+                    target_angle,
+                    target_omega,
+                    aim_point_y: p_e.y,
+                    p_e: Some(p_e),
+                }
+            } else {
+                let r = c.position_at(next_tick) - next_gun0_pos;
+                let r_len_sq = r.dot(r);
+                let target_omega = if r_len_sq > 1e-6 {
+                    (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
+                } else {
+                    0.0
+                };
+                let target_angle = r.angle();
+                FiringSolution {
+                    time_to_impact: None,
+                    lead_dir: None,
+                    target_angle,
+                    target_omega,
+                    aim_point_y: c.position_at(next_tick).y,
+                    p_e: None,
+                }
+            };
+            solutions.insert(c.id, sol);
+        }
+
+
         // 4. Update Weapon Assignment
         // Select the tracked contact with the minimum number of firing attempts.
         // If attempts are equal, choose the target that is furthest north in its firing solution.
         let mut best_target: Option<&crate::radar::Contact> = None;
         for c in contacts {
-            let turn_time = self.target_aim_time(c);
-            let sol_y = self.target_firing_solution_y(c);
+            let sol = &solutions[&c.id];
+            let turn_time = self.target_aim_time(sol);
+            let sol_y = sol.aim_point_y;
             let ci_c = 3.89 * c.current_pos_uncertainty();
             debug!("Target {} considered: turn time = {:.3}s, firing sol Y = {:.1}m, CI = {:.1}m att={}", c.id, turn_time, sol_y, ci_c, *self.fire_counts.get(&c.id).unwrap_or(&0));
 
@@ -259,7 +228,8 @@ impl Ship {
                     if attempts_c < attempts_best {
                         best_target = Some(c);
                     } else if attempts_c == attempts_best {
-                        if self.is_better_target(c, best) {
+                        let best_sol = &solutions[&best.id];
+                        if self.is_better_target(c.id, sol, best.id, best_sol) {
                             best_target = Some(c);
                         }
                     }
@@ -280,35 +250,58 @@ impl Ship {
         // Gun 0: Forward-pointing high-velocity gun (Bullet Speed: 4000.0 m/s, Local Offset: [40.0, 0.0])
         if let Some(tid) = self.weapon_target {
             if let Some(c) = contacts.iter().find(|contact| contact.id == tid) {
-                const GUN0_BULLET_SPEED: f64 = 4000.0;
-                let gun0_offset = Vec2::new(40.0, 0.0);
-                let gun0_pos = position() + gun0_offset.rotate(heading());
-
-                if let Some((time_to_impact, lead_dir)) = predict_lead_exact(
-                    gun0_pos,
-                    velocity(),
-                    GUN0_BULLET_SPEED,
-                    c.current_position(),
-                    c.current_velocity(),
-                    c.acceleration,
-                ) {
-                    let lead_angle = lead_dir.angle();
-                    let target_omega = self.angle_tracker.update(lead_angle);
+                let sol = &solutions[&tid];
+                if let (Some(time_to_impact), Some(_lead_dir), Some(p_e)) = (sol.time_to_impact, sol.lead_dir, sol.p_e) {
+                    let lead_angle = sol.target_angle;
+                    let target_omega = sol.target_omega;
                     quick_turn_with_target_omega(lead_angle, target_omega);
 
                     // Visualization
-                    let p_e = c.position_at(current_tick + (time_to_impact / TICK_LENGTH).round() as u32);
+                    // Red: Predicted target position at impact if fired next turn
                     draw_line(gun0_pos, p_e, rgb(255, 0, 0));
                     draw_square(p_e, 25.0, rgb(255, 0, 0));
 
+                    // Yellow: Aim line and bullet position at impact if fired this turn
+                    let bullet_pos_this_turn = gun0_pos + time_to_impact * velocity() + time_to_impact * GUN0_BULLET_SPEED * vec2(heading().cos(), heading().sin());
+                    draw_line(gun0_pos, bullet_pos_this_turn, rgb(255, 255, 0));
+                    draw_square(bullet_pos_this_turn, 20.0, rgb(255, 255, 0));
+
+                    // Green: Desired firing solution from the previous turn
+                    if let Some(ref prev_sol) = self.prev_intended_solution {
+                        if prev_sol.target_id == c.id {
+                            draw_diamond(prev_sol.aim_point, 30.0, rgb(0, 255, 0));
+                        }
+                    }
+
                     // Fire when aligned such that the bullet passes within 2 meters of the firing solution
                     // Never fire on anything where the 99.99% confidence interval is more than 20m in size
-                    let bullet_pos_at_impact = gun0_pos + time_to_impact * velocity() + time_to_impact * GUN0_BULLET_SPEED * vec2(heading().cos(), heading().sin());
-                    let pass_dist = bullet_pos_at_impact.distance(p_e);
-                    let ci_size = 3.89 * c.current_pos_uncertainty();
+                    let (aligned, _pass_dist) = if let Some(ref prev_sol) = self.prev_intended_solution {
+                        if prev_sol.target_id == c.id {
+                            let t_bullet = prev_sol.time_to_impact;
+                            if t_bullet > 0.0 {
+                                let bullet_pos_at_impact = gun0_pos + t_bullet * velocity() + t_bullet * GUN0_BULLET_SPEED * vec2(heading().cos(), heading().sin());
+                                let dist = bullet_pos_at_impact.distance(prev_sol.aim_point);
+                                let is_aligned = dist <= 5.0;
+                                debug!("Alignment check to prev turn aim point: pass_dist = {:.3}m (aligned: {})", dist, is_aligned);
+                                (is_aligned, dist)
+                            } else {
+                                (false, f64::MAX)
+                            }
+                        } else {
+                            (false, f64::MAX)
+                        }
+                    } else {
+                        (false, f64::MAX)
+                    };
                     
+                    self.prev_intended_solution = Some(IntendedSolution {
+                        target_id: c.id,
+                        aim_point: p_e,
+                        time_to_impact,
+                    });
+
+                    let ci_size = 3.89 * c.current_pos_uncertainty();
                     let gun_ready = reload_ticks(0) == 0;
-                    let aligned = pass_dist <= 1.0;
                     let locked_on = ci_size <= 20.0;
 
                     if gun_ready && aligned && locked_on {
@@ -320,17 +313,13 @@ impl Ship {
 
                         for other in contacts {
                             if other.id != c.id {
+                                if self.fire_counts.get(&other.id).copied().unwrap_or(0) > 0 {
+                                    continue;
+                                }
                                 let other_dist = position().distance(other.current_position());
                                 if other_dist < target_dist {
-                                    if let Some((t_other, _)) = predict_lead_exact(
-                                        gun0_pos,
-                                        velocity(),
-                                        GUN0_BULLET_SPEED,
-                                        other.current_position(),
-                                        other.current_velocity(),
-                                        other.acceleration,
-                                    ) {
-                                        let p_e_other = other.position_at(current_tick + (t_other / TICK_LENGTH).round() as u32);
+                                    let other_sol = &solutions[&other.id];
+                                    if let (Some(t_other), Some(p_e_other)) = (other_sol.time_to_impact, other_sol.p_e) {
                                         let p_b_other = gun0_pos + t_other * velocity() + t_other * GUN0_BULLET_SPEED * vec2(heading().cos(), heading().sin());
                                         let pass_dist_other = p_b_other.distance(p_e_other);
                                         let collides = pass_dist_other <= 15.0;
@@ -356,25 +345,30 @@ impl Ship {
                             expiry_tick,
                         });
                     } else {
-                        let mut reasons = Vec::new();
-                        if !gun_ready {
-                            reasons.push(format!("reloading ({} ticks left)", reload_ticks(0)));
-                        }
-                        if !aligned {
-                            reasons.push(format!("not aligned (pass_dist = {:.2}m > 1.0m)", pass_dist));
-                        }
-                        if !locked_on {
-                            reasons.push(format!("high target uncertainty (CI = {:.1}m > 20.0m)", ci_size));
-                        }
-                        debug!("Did not fire on target {}: {}", tid, reasons.join(", "));
+                        // let mut reasons = Vec::new();
+                        // if !gun_ready {
+                        //     reasons.push(format!("reloading ({} ticks left)", reload_ticks(0)));
+                        // }
+                        // if !aligned {
+                        //     reasons.push(format!("not aligned (pass_dist = {:.2}m > 1.0m)", pass_dist));
+                        // }
+                        // if !locked_on {
+                        //     reasons.push(format!("high target uncertainty (CI = {:.1}m > 20.0m)", ci_size));
+                        // }
+                        // debug!("Did not fire on target {}: {}", tid, reasons.join(", "));
                     }
                 } else {
-                    let direct_angle = (c.current_position() - gun0_pos).angle();
-                    let target_omega = self.angle_tracker.update(direct_angle);
+                    let direct_angle = sol.target_angle;
+                    let target_omega = sol.target_omega;
                     quick_turn_with_target_omega(direct_angle, target_omega);
                     debug!("Did not fire on target {}: lead prediction failed", tid);
+                    self.prev_intended_solution = None;
                 }
+            } else {
+                self.prev_intended_solution = None;
             }
+        } else {
+            self.prev_intended_solution = None;
         }
 
         // 6. Draw expected intercept plots for debug
