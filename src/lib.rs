@@ -13,5 +13,4 @@ pub mod tutorial_cruiser;
 pub mod mission_gunnery;
 pub mod mission_cruiser_defense;
 pub mod radio;
-
-
+pub mod fighter_duel;

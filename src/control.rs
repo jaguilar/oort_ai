@@ -815,9 +815,20 @@ impl MissileGuidance {
                 debug!("Lat Acc X: {:.2}, Y: {:.2}", a_lateral.x, a_lateral.y);
                 debug!("Fwd Acc X: {:.2}, Y: {:.2}", (dir * forward_acc).x, (dir * forward_acc).y);
 
-                // Boost to reach target faster, but only if not in fuel economy mode
-                if !fuel_economy {
+                // Boost should only be used while the target-direction acceleration vector component is greater than 100 m/s^2
+                // and the missile is aimed toward the direction it is trying to accelerate in.
+                // If that is not the case, actively deactivate boost.
+                let target_accel_component = a_total.dot(dir);
+                let aimed_correctly = if a_total.length() > 0.0 {
+                    angle_diff(heading(), a_total.angle()).abs() < 5.0f64.to_radians()
+                } else {
+                    false
+                };
+
+                if !fuel_economy && target_accel_component > 100.0 && aimed_correctly {
                     activate_ability(Ability::Boost);
+                } else {
+                    deactivate_ability(Ability::Boost);
                 }
 
                 // Draw projected intercept point of the currently selected target
@@ -844,11 +855,7 @@ impl MissileGuidance {
             debug!("Acc Y: {:.2}", a_cmd.y);
 
             accelerate(a_cmd);
-            if mode == "Search Mode" {
-                activate_ability(Ability::Boost);
-            } else {
-                deactivate_ability(Ability::Boost);
-            }
+            deactivate_ability(Ability::Boost);
         }
     }
 }
