@@ -1,8 +1,10 @@
 use oort_api::prelude::*;
-use crate::control::{predict_lead, quick_turn_with_target_omega, AngleTracker, TargetTracker};
+use crate::control::{predict_lead, quick_turn_with_target_omega, AngleTracker};
 
 pub struct Ship {
-    target_tracker: TargetTracker,
+    target_pos: Option<Vec2>,
+    target_vel: Option<Vec2>,
+    target_accel: Vec2,
     angle_tracker: AngleTracker,
     tracked_bullet: Option<TrackedBullet>,
 }
@@ -21,7 +23,9 @@ impl Ship {
         set_radio_channel(2);
 
         Ship {
-            target_tracker: TargetTracker::new(),
+            target_pos: None,
+            target_vel: None,
+            target_accel: Vec2::new(0.0, 0.0),
             angle_tracker: AngleTracker::new(5.0), // 5 frames time constant
             tracked_bullet: None,
         }
@@ -38,14 +42,19 @@ impl Ship {
         if let Some(msg) = receive() {
             let enemy_pos = vec2(msg[0], msg[1]);
             let enemy_vel = vec2(msg[2], msg[3]);
-            self.target_tracker.update(current_tick(), enemy_pos, enemy_vel);
+            let accel = if let Some(prev_vel) = self.target_vel {
+                (enemy_vel - prev_vel) / TICK_LENGTH
+            } else {
+                Vec2::new(0.0, 0.0)
+            };
+            self.target_pos = Some(enemy_pos);
+            self.target_vel = Some(enemy_vel);
+            self.target_accel = accel;
         }
 
         // 2. Aim, steer and shoot if we have located the target
-        if self.target_tracker.last_seen_tick().is_some() {
-            let target_pos = self.target_tracker.position();
-            let target_vel = self.target_tracker.velocity();
-            let target_accel = self.target_tracker.acceleration();
+        if let (Some(target_pos), Some(target_vel)) = (self.target_pos, self.target_vel) {
+            let target_accel = self.target_accel;
 
             // Draw target visualization
             draw_square(target_pos, 25.0, rgb(255, 0, 0));
@@ -54,7 +63,7 @@ impl Ship {
             // Follow target: PD controller targeting the enemy position while matching their velocity
             let pos_error = target_pos - position();
             let vel_error = target_vel - velocity();
-            accelerate(0.2 * pos_error + 0.8 * vel_error);
+            accelerate(pos_error * 0.2 + vel_error * 0.8);
 
             // Predict optimal lead target angle and time-to-impact
             let mut target_angle_now = None;

@@ -1,8 +1,8 @@
 use oort_api::prelude::*;
-use crate::control::{predict_lead, quick_turn_with_target_omega, TargetTracker, AngleTracker};
+use crate::control::{predict_lead, quick_turn_with_target_omega, AngleTracker};
 
 pub struct Ship {
-    target_tracker: TargetTracker,
+    prev_target_vel: Option<Vec2>,
     angle_tracker: AngleTracker,
     tracked_bullet: Option<TrackedBullet>,
 }
@@ -17,7 +17,7 @@ struct TrackedBullet {
 impl Ship {
     pub fn new() -> Ship {
         Ship {
-            target_tracker: TargetTracker::new(),
+            prev_target_vel: None,
             angle_tracker: AngleTracker::new(5.0), // 5 frames time constant
             tracked_bullet: None,
         }
@@ -28,9 +28,13 @@ impl Ship {
         let our_accel = Vec2::new(0.0, 0.0);
         accelerate(our_accel);
 
-        // Track target state using the tracker helper
-        self.target_tracker.update(current_tick(), target(), target_velocity());
-        let target_accel = self.target_tracker.acceleration();
+        // Track target state locally
+        let current_target_vel = target_velocity();
+        let target_accel = match self.prev_target_vel {
+            Some(prev_vel) => (current_target_vel - prev_vel) / TICK_LENGTH,
+            None => Vec2::new(0.0, 0.0),
+        };
+        self.prev_target_vel = Some(current_target_vel);
 
         const BULLET_SPEED: f64 = 1000.0;
 

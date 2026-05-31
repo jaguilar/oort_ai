@@ -1,5 +1,5 @@
 use oort_api::prelude::*;
-use crate::radar::{RadarController, Contact};
+use crate::radar::{RadarController, Contact, RADIO_PING_SNR};
 
 /// Calculates the clamped torque required to turn toward the target angle, taking target angular velocity into account.
 pub fn quick_turn_torque_with_target_omega(target_angle: f64, target_omega: f64) -> f64 {
@@ -440,72 +440,14 @@ impl AngleTracker {
     }
 }
 
-/// Tracks the estimated position, velocity, and acceleration of a target over ticks.
-pub struct TargetTracker {
-    last_seen_tick: Option<u32>,
-    position: Vec2,
-    velocity: Vec2,
-    acceleration: Vec2,
-}
-
-impl TargetTracker {
-    pub fn new() -> Self {
-        Self {
-            last_seen_tick: None,
-            position: Vec2::new(0.0, 0.0),
-            velocity: Vec2::new(0.0, 0.0),
-            acceleration: Vec2::new(0.0, 0.0),
-        }
-    }
-
-    pub fn update(&mut self, current_tick: u32, pos: Vec2, vel: Vec2) {
-        if let Some(last_tick) = self.last_seen_tick {
-            let dt = (current_tick - last_tick) as f64 * TICK_LENGTH;
-            if dt > 0.0 {
-                self.acceleration = (vel - self.velocity) / dt;
-            }
-        } else {
-            self.acceleration = Vec2::new(0.0, 0.0);
-        }
-        self.position = pos;
-        self.velocity = vel;
-        self.last_seen_tick = Some(current_tick);
-    }
-
-    pub fn position(&self) -> Vec2 {
-        self.position
-    }
-
-    pub fn velocity(&self) -> Vec2 {
-        self.velocity
-    }
-
-    pub fn acceleration(&self) -> Vec2 {
-        self.acceleration
-    }
-
-    pub fn last_seen_tick(&self) -> Option<u32> {
-        self.last_seen_tick
-    }
-
-    /// Extrapolates the target's position and velocity at the current tick if we didn't scan it this tick.
-    pub fn extrapolate(&self, current_tick: u32) -> (Vec2, Vec2) {
-        if let Some(last_tick) = self.last_seen_tick {
-            let dt = (current_tick - last_tick) as f64 * TICK_LENGTH;
-            let pred_vel = self.velocity + self.acceleration * dt;
-            let pred_pos = self.position + self.velocity * dt + 0.5 * self.acceleration * dt * dt;
-            (pred_pos, pred_vel)
-        } else {
-            (self.position, self.velocity)
-        }
-    }
-}
-
 /// Telemetry data for a tracked target, transmitted securely over radio.
 #[derive(Clone, Copy, Debug)]
 pub struct TargetTelemetry {
     pub position: Vec2,
     pub velocity: Vec2,
+    pub rssi: f32,
+    pub class: Class,
+    pub tick: u8,
 }
 
 impl TargetTelemetry {
@@ -515,6 +457,17 @@ impl TargetTelemetry {
         payload[4..8].copy_from_slice(&(self.position.y as f32).to_le_bytes());
         payload[8..12].copy_from_slice(&(self.velocity.x as f32).to_le_bytes());
         payload[12..16].copy_from_slice(&(self.velocity.y as f32).to_le_bytes());
+        payload[16..20].copy_from_slice(&self.rssi.to_le_bytes());
+        payload[20] = self.tick;
+        payload[21] = match self.class {
+                 => 1,
+            Class::Frigate => 2,
+            Class::Cruiser => 3,
+            Class::Missile => 4,
+            Class::Torpedo => 5,
+            Class::Target => 6,
+            _ => 0,
+        };
         payload
     }
 
@@ -523,9 +476,23 @@ impl TargetTelemetry {
         let pos_y = f32::from_le_bytes(payload[4..8].try_into().unwrap()) as f64;
         let vel_x = f32::from_le_bytes(payload[8..12].try_into().unwrap()) as f64;
         let vel_y = f32::from_le_bytes(payload[12..16].try_into().unwrap()) as f64;
+        let rssi = f32::from_le_bytes(payload[16..20].try_into().unwrap());
+        let tick = payload[20];
+        let class = match payload[21] {
+            1 => Class::Fighter,
+            2 => Class::Frigate,
+            3 => Class::Cruiser,
+            4 => Class::Missile,
+            5 => Class::Torpedo,
+            6 => Class::Target,
+            _ => Class::Fighter,
+        };
         TargetTelemetry {
             position: vec2(pos_x, pos_y),
             velocity: vec2(vel_x, vel_y),
+            rssi,
+            class,
+            tick,
         }
     }
 }
@@ -539,7 +506,7 @@ pub struct MissileGuidance {
     pub pn_gain: f64,
     pub pn_min_vc: f64,
     pub target_lock_delay_ticks: u32,
-    pub fuel_economy_dv_threshold: f64,
+    pub fuel_economy_vc_threshold: f64,
     pub min_search_fuel: f64,
     pub turn_safety_buffer_ticks: f64,
 
@@ -550,7 +517,6 @@ pub struct MissileGuidance {
     pub target_id: Option<u32>,
     pub first_detection_tick: Option<u32>,
     pub target_channel: usize,
-    pub radio_target_tracker: TargetTracker,
     pub secure_radio: Option<crate::radio::SecureRadio>,
 }
 
@@ -571,7 +537,7 @@ impl MissileGuidance {
             pn_gain: 4.0,
             pn_min_vc: 100.0,
             target_lock_delay_ticks: 22,
-            fuel_economy_dv_threshold: 500.0,
+            fuel_economy_vc_threshold: 800.0,
             min_search_fuel: 500.0,
             turn_safety_buffer_ticks: 1.0,
 
@@ -581,25 +547,86 @@ impl MissileGuidance {
             target_id: None,
             first_detection_tick: None,
             target_channel: 3,
-            radio_target_tracker: TargetTracker::new(),
             secure_radio: None,
         }
     }
 
+    fn target_position_at(&self, target: &Contact, tick: u32, vel_eff: Vec2, accel_eff: Vec2) -> Vec2 {
+        let dt = (tick as f64 - target.last_scanned as f64) * TICK_LENGTH;
+        target.position + vel_eff * dt + 0.5 * accel_eff * dt * (dt + TICK_LENGTH)
+    }
+
+    fn calculate_intercept(&self, target: &Contact) -> (f64, Vec2) {
+        let r = target.current_position() - position();
+        let r_len = r.length();
+        let v_rel = target.current_velocity() - velocity();
+        let v_c = if r_len > 1e-6 { -v_rel.dot(r) / r_len } else { 0.0 };
+        let t_go = if v_c > 0.0 { r_len / v_c } else { f64::MAX };
+
+        // If we're travelling very slowly compared to the target, then any small amount of velocity
+        // will make intercept seem impossibly far away. We only pay attention to the enemy's velocity once we are moving.
+        let vel_weight = ((v_c - 100.0) / 300.0).clamp(0.0, 1.0);
+
+        // Similarly, if we're a long way from intercept, the target can make us burn a lot of d_v
+        // by juking, when really whether that even matters is unpredictable until we get closer.
+        let accel_weight = ((5.0 - t_go)/2.0).clamp(0.0, 1.0);
+
+        let intercept_tick = current_tick() + (t_go / TICK_LENGTH).round() as u32;
+        let intercept_point = self.target_position_at(target, intercept_tick, target.velocity * vel_weight, target.acceleration * accel_weight);
+
+        (t_go, intercept_point)
+    }
+
+    fn determine_guidance_mode(
+        &self,
+        has_target: bool,
+        is_terminal: bool,
+        fuel_economy: bool,
+    ) -> &'static str {
+        if !has_target {
+            if fuel() >= self.min_search_fuel {
+                "Search Mode"
+            } else {
+                "Coast Mode"
+            }
+        } else if is_terminal {
+            "Terminal Turn"
+        } else if fuel_economy {
+            "Fuel Economy"
+        } else {
+            "Standard PN Guidance"
+        }
+    }
+
+
+    fn check_fuel_economy(&self, v_c: f64, r_len: f64, target_class: Class) -> bool {
+        let possible_enemy_dv = if v_c > 0.0 {
+            let t_intercept = r_len / v_c;
+            let base_dv = t_intercept * target_class.default_stats().max_forward_acceleration;
+            let boost_dv = (t_intercept / 10.0).ceil() * 100.0;
+            base_dv + boost_dv
+        } else {
+            0.0
+        };
+        v_c >= self.fuel_economy_vc_threshold && fuel() < possible_enemy_dv
+    }
+
     pub fn tick(&mut self) {
-        let mut radio_ping = None;
+        let mut received_radio = false;
 
         if let Some(ref sr) = self.secure_radio {
             // Secure radio mode
             if let Some(payload) = sr.receive() {
                 let telemetry = TargetTelemetry::deserialize(&payload);
-                self.radio_target_tracker.update(current_tick(), telemetry.position, telemetry.velocity);
-                let accel = self.radio_target_tracker.acceleration();
-                debug!("Decoded secure radio ping: pos=({:.1}, {:.1}) vel=({:.1}, {:.1})", telemetry.position.x, telemetry.position.y, telemetry.velocity.x, telemetry.velocity.y);
-                radio_ping = Some((telemetry.position, telemetry.velocity, accel));
-            }
-            // Prepare for next tick
-            sr.prepare_receive(0);
+                debug!("Decoded secure radio ping: pos=({:.1}, {:.1}) vel=({:.1}, {:.1}) rssi={} class={:?}", telemetry.position.x, telemetry.position.y, telemetry.velocity.x, telemetry.velocity.y, telemetry.rssi, telemetry.class);
+                let target_id = self.radar_controller.add_radio_ping(telemetry);
+                received_radio = true;
+                if self.target_id.is_none() {
+                    self.target_id = Some(target_id)
+                }
+            } 
+
+            sr.prepare_receive();
         } else {
             // Standard radio mode
             // 1. Listen on the target radio channel
@@ -619,91 +646,69 @@ impl MissileGuidance {
                     && pos_x.abs() < 100_000.0 && pos_y.abs() < 100_000.0
                     && vel_x.abs() < 10_000.0 && vel_y.abs() < 10_000.0
                 {
-                    let pos = vec2(pos_x, pos_y);
-                    let vel = vec2(vel_x, vel_y);
-                    self.radio_target_tracker.update(current_tick(), pos, vel);
-                    let accel = self.radio_target_tracker.acceleration();
-                    debug!("Decoded radio float ping on channel {}: pos=({:.1}, {:.1}) vel=({:.1}, {:.1})", self.target_channel, pos.x, pos.y, vel.x, vel.y);
-                    radio_ping = Some((pos, vel, accel));
+                    let telemetry = TargetTelemetry {
+                        position: vec2(pos_x, pos_y),
+                        velocity: vec2(vel_x, vel_y),
+                        rssi: 0.0,
+                        class: Class::Fighter,
+                        tick: current_tick() as u8,
+                    };
+                    debug!("Decoded radio float ping on channel {}: pos=({:.1}, {:.1})", self.target_channel, telemetry.position.x, telemetry.position.y);
+                    self.radar_controller.add_radio_ping(telemetry);
+                    received_radio = true;
                 }
             }
         }
 
         // Set current target as high priority in the radar controller
         self.radar_controller.priority_targets = self.target_id.map(|id| vec![id]).unwrap_or_default();
-
-        // Update radar controller
         self.radar_controller.update();
-
-        // 2. Insert/update target in radar contact database if received via radio
-        let mut radio_target_id = None;
-        if let Some((pos, vel, accel)) = radio_ping {
-            let mut has_good_lock = false;
-            if let Some(tid) = self.target_id {
-                if let Some(contact) = self.radar_controller.contacts().iter().find(|c| c.id == tid) {
-                    if 3.89 * contact.current_pos_uncertainty() <= 50.0 {
-                        has_good_lock = true;
-                    }
-                }
-            }
-
-            if !has_good_lock {
-                let contact_id = self.radar_controller.update_from_radio(pos, vel, accel, self.target_id);
-                radio_target_id = Some(contact_id);
-                if let Some(old_id) = self.target_id {
-                    if old_id != contact_id {
-                        debug!("Ceasing targeting of target {} to lock onto radio target {} (reason: current target has poor lock or is lost)", old_id, contact_id);
-                    }
-                }
-                self.target_id = Some(contact_id);
-            } else {
-                debug!("Ignoring radio telemetry: current target has a good lock (CI within 50m).");
-            }
-        }
-
         let contacts = self.radar_controller.contacts();
+        let current_t = current_tick();
 
         // 3. Target selection
-        if radio_target_id.is_none() {
-            // A target is valid if it is still tracked in the contact list and is a Fighter
-            let target_still_valid = if let Some(id) = self.target_id {
-                contacts.iter().any(|c| c.id == id && c.class == Class::Fighter)
+        // A target is valid if it is still tracked in the contact list and is a Fighter
+        let target_still_valid = if let Some(id) = self.target_id {
+            contacts.iter().any(|c| c.id == id && c.class != Class::Missile)
+        } else {
+            false
+        };
+
+        // Filter contacts to only target Class::Fighter
+        let fighters: Vec<&Contact> = contacts.iter()
+            .filter(|c| c.class != Class::Missile)
+            .collect();
+
+        // Set the first detection tick if we've just detected a fighter
+        if !fighters.is_empty() && self.first_detection_tick.is_none() {
+            self.first_detection_tick = Some(current_t);
+        }
+
+        if !target_still_valid {
+            // Delay target selection until we've had time for two full scans after first target detection,
+            // unless we have a confirmed target from radio telemetry (indicated by snr == RADIO_PING_SNR).
+            let has_confirmed_radio_fighter = fighters.iter().any(|f| f.snr == RADIO_PING_SNR);
+            let can_lock = if has_confirmed_radio_fighter {
+                true
+            } else if let Some(first_tick) = self.first_detection_tick {
+                current_t - first_tick >= self.target_lock_delay_ticks
             } else {
                 false
             };
 
-            // Filter contacts to only target Class::Fighter
-            let fighters: Vec<&Contact> = contacts.iter()
-                .filter(|c| c.class == Class::Fighter)
-                .collect();
-
-            // Set the first detection tick if we've just detected a fighter
-            if !fighters.is_empty() && self.first_detection_tick.is_none() {
-                self.first_detection_tick = Some(current_tick());
-            }
-
-            if !target_still_valid {
-                // Delay target selection until we've had time for two full scans after first target detection
-                let can_lock = if let Some(first_tick) = self.first_detection_tick {
-                    current_tick() - first_tick >= self.target_lock_delay_ticks
-                } else {
-                    false
-                };
-
-                if can_lock && !fighters.is_empty() {
-                    // Pick a random fighter instead of the closest one
-                    let idx = (rand(0.0, fighters.len() as f64).floor() as usize).min(fighters.len() - 1);
-                    let new_id = fighters[idx].id;
-                    if let Some(old_id) = self.target_id {
-                        debug!("Ceasing targeting of target {} because it is no longer valid (not in contacts list or not a fighter); locking onto new target {}", old_id, new_id);
-                    }
-                    self.target_id = Some(new_id);
-                } else {
-                    if let Some(old_id) = self.target_id {
-                        debug!("Ceasing targeting of target {} because it is no longer valid (not in contacts list or not a fighter) and no new target lock could be acquired", old_id);
-                    }
-                    self.target_id = None;
+            if can_lock && !fighters.is_empty() {
+                // Pick a random fighter instead of the closest one
+                let idx = (rand(0.0, fighters.len() as f64).floor() as usize).min(fighters.len() - 1);
+                let new_id = fighters[idx].id;
+                if let Some(old_id) = self.target_id {
+                    debug!("Ceasing targeting of target {} because it is no longer valid (not in contacts list or not a fighter); locking onto new target {}", old_id, new_id);
                 }
+                self.target_id = Some(new_id);
+            } else {
+                if let Some(old_id) = self.target_id {
+                    debug!("Ceasing targeting of target {} because it is no longer valid (not in contacts list or not a fighter) and no new target lock could be acquired", old_id);
+                }
+                self.target_id = None;
             }
         }
 
@@ -733,6 +738,9 @@ impl MissileGuidance {
                 // Closing velocity
                 let v_c = -v_rel.dot(r) / r_len;
 
+                // Calculate the anticipated intercept point using the weighted acceleration logic
+                let (time_to_intercept, intercept_point) = self.calculate_intercept(target);
+
                 // Lateral acceleration command perpendicular to LOS in the direction of rotation
                 let e_perp = vec2(-r.y, r.x) / r_len;
                 let a_lateral = self.pn_gain * v_c.max(self.pn_min_vc) * los_rate * e_perp;
@@ -744,18 +752,8 @@ impl MissileGuidance {
                     vec2(heading().cos(), heading().sin())
                 };
 
-                let expended_fuel = self.initial_fuel - fuel();
-                let possible_enemy_dv = if v_c > 0.0 {
-                    let t_intercept = r_len / v_c;
-                    let base_dv = t_intercept * target_class.default_stats().max_forward_acceleration;
-                    let boost_dv = (t_intercept / 10.0).ceil() * 100.0;
-                    base_dv + boost_dv
-                } else {
-                    0.0
-                };
-
-                // Engages if we have expended at least threshold delta v and remaining fuel is low
-                let fuel_economy = expended_fuel >= self.fuel_economy_dv_threshold && fuel() < possible_enemy_dv;
+                // Check if we need to engage fuel economy mode (e.g. if fuel is low relative to possible enemy maneuvers)
+                let fuel_economy = self.check_fuel_economy(v_c, r_len, target_class);
 
                 let forward_acc = if fuel_economy {
                     0.0
@@ -763,11 +761,29 @@ impl MissileGuidance {
                     max_forward_acceleration()
                 };
 
-                let a_total = a_lateral + dir * forward_acc;
+                let a_total = if !fuel_economy {
+                    let r_intercept = intercept_point - position();
+                    let dir_intercept = if r_intercept.length() > 1e-6 {
+                        r_intercept.normalize()
+                    } else {
+                        vec2(heading().cos(), heading().sin())
+                    };
 
+                    let perp_dir = vec2(-dir_intercept.y, dir_intercept.x);
+                    let v_perp = velocity().dot(perp_dir);
+                    let alpha = if v_perp.abs() <= 100.0 {
+                        (-v_perp / 100.0).asin()
+                    } else {
+                        -v_perp.signum() * std::f64::consts::FRAC_PI_2
+                    };
+                    let desired_boost_heading = dir_intercept.angle() + alpha;
+                    let acc_dir = vec2(desired_boost_heading.cos(), desired_boost_heading.sin());
+                    acc_dir * (max_forward_acceleration() + 100.0)
+                } else {
+                    a_lateral + dir * forward_acc
+                };
 
                 // Turn to point directly at target intercept point when it's time to explode
-                let time_to_intercept = if v_c > 0.0 { r_len / v_c } else { f64::MAX };
                 let time_until_explosion = (time_to_intercept - self.proximity_ticks * TICK_LENGTH).max(0.0);
 
                 // Heading we need to face at the moment of explosion
@@ -802,13 +818,7 @@ impl MissileGuidance {
 
                 // Print guidance mode and acceleration components
                 let is_terminal = time_until_explosion <= turn_time_with_buffer;
-                let mode = if is_terminal {
-                    "Terminal Turn"
-                } else if fuel_economy {
-                    "Fuel Economy"
-                } else {
-                    "Standard PN Guidance"
-                };
+                let mode = self.determine_guidance_mode(true, is_terminal, fuel_economy);
                 debug!("Mode: {}", mode);
                 debug!("Acc X: {:.2}", a_total.x);
                 debug!("Acc Y: {:.2}", a_total.y);
@@ -818,7 +828,11 @@ impl MissileGuidance {
                 // Boost should only be used while the target-direction acceleration vector component is greater than 100 m/s^2
                 // and the missile is aimed toward the direction it is trying to accelerate in.
                 // If that is not the case, actively deactivate boost.
-                let target_accel_component = a_total.dot(dir);
+                let target_accel_component = if !fuel_economy {
+                    a_total.length()
+                } else {
+                    a_total.dot(dir)
+                };
                 let aimed_correctly = if a_total.length() > 0.0 {
                     angle_diff(heading(), a_total.angle()).abs() < 5.0f64.to_radians()
                 } else {
@@ -833,9 +847,9 @@ impl MissileGuidance {
 
                 // Draw projected intercept point of the currently selected target
                 if v_c > 0.0 {
-                    let intercept_point = target.position_at(current_tick() + (time_to_intercept / TICK_LENGTH).round() as u32);
                     draw_diamond(intercept_point, 16.0, rgb(255, 0, 0));
                     draw_line(position(), intercept_point, rgb(255, 0, 0));
+                    draw_line(target_pos, intercept_point, rgb(0, 255, 0)); // Draw vector from target to intercept in green
                     draw_text!(intercept_point + vec2(0.0, 20.0), rgb(255, 0, 0), "Intercept: {:.2}s", time_to_intercept);
                 }
 
@@ -844,11 +858,12 @@ impl MissileGuidance {
             }
         } else {
             // No target - burn straight ahead at maximum speed until we find a lock, provided we retain fuel
-            let (mode, a_cmd) = if fuel() >= self.min_search_fuel {
+            let mode = self.determine_guidance_mode(false, false, false);
+            let a_cmd = if mode == "Search Mode" {
                 let heading_dir = vec2(heading().cos(), heading().sin());
-                ("Search Mode", heading_dir * max_forward_acceleration())
+                heading_dir * max_forward_acceleration()
             } else {
-                ("Coast Mode", vec2(0.0, 0.0))
+                vec2(0.0, 0.0)
             };
             debug!("Mode: {}", mode);
             debug!("Acc X: {:.2}", a_cmd.x);
@@ -1546,6 +1561,9 @@ mod tests {
         let telemetry = TargetTelemetry {
             position: vec2(12345.67, -9876.54),
             velocity: vec2(-456.78, 987.65),
+            rssi: -45.67,
+            class: Class::Fighter,
+            tick: 123,
         };
         let payload = telemetry.serialize();
         let deserialized = TargetTelemetry::deserialize(&payload);
@@ -1554,5 +1572,44 @@ mod tests {
         assert!((telemetry.position.y - deserialized.position.y).abs() < 1e-1);
         assert!((telemetry.velocity.x - deserialized.velocity.x).abs() < 1e-2);
         assert!((telemetry.velocity.y - deserialized.velocity.y).abs() < 1e-2);
+        assert!((telemetry.rssi - deserialized.rssi).abs() < 1e-3);
+        assert_eq!(telemetry.tick, deserialized.tick);
+        assert_eq!(telemetry.class, deserialized.class);
+    }
+
+    #[test]
+    fn test_missile_guidance_math() {
+        // Test acceleration weight function
+        let weight = |t_go: f64| {
+            if t_go >= 5.0 {
+                0.0
+            } else if t_go < 3.0 {
+                1.0
+            } else {
+                (5.0 - t_go) / 2.0
+            }
+        };
+        assert_eq!(weight(6.0), 0.0);
+        assert_eq!(weight(5.0), 0.0);
+        assert_eq!(weight(4.0), 0.5);
+        assert_eq!(weight(3.0), 1.0);
+        assert_eq!(weight(2.0), 1.0);
+
+        // Test alpha calculation to cancel transverse velocity
+        let calculate_alpha = |v_perp: f64, v_boost: f64| {
+            if v_perp.abs() <= v_boost {
+                (-v_perp / v_boost).asin()
+            } else {
+                -v_perp.signum() * std::f64::consts::FRAC_PI_2
+            }
+        };
+        // If v_perp is 0, alpha should be 0
+        assert_eq!(calculate_alpha(0.0, 100.0), 0.0);
+        // If v_perp is 50.0 and v_boost is 100.0, sin(alpha) should be -0.5, so alpha = -pi/6
+        assert!((calculate_alpha(50.0, 100.0) - (-std::f64::consts::FRAC_PI_6)).abs() < 1e-6);
+        // If v_perp is -50.0, alpha = pi/6
+        assert!((calculate_alpha(-50.0, 100.0) - std::f64::consts::FRAC_PI_6).abs() < 1e-6);
+        // If v_perp is larger than v_boost, it should clamp to -pi/2
+        assert_eq!(calculate_alpha(150.0, 100.0), -std::f64::consts::FRAC_PI_2);
     }
 }

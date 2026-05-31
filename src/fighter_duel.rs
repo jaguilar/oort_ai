@@ -1,7 +1,9 @@
 use oort_api::prelude::*;
-use crate::control::{quick_turn_with_target_omega, predict_lead, AngleTracker, MissileGuidance, TargetTelemetry, TargetTracker};
+use std::rc::Rc;
+use std::cell::RefCell;
+use crate::control::{quick_turn_with_target_omega, predict_lead, AngleTracker, MissileGuidance, TargetTelemetry};
 use crate::radar::{RadarController, DefaultScanSliceGenerator, Contact};
-use crate::radio::SecureRadio;
+use crate::radio::{SecureRadio, RadioManager};
 
 pub struct Ship {
     radar_controller: RadarController,
@@ -10,7 +12,6 @@ pub struct Ship {
     
     missile_radio: SecureRadio,
     fighter_radio: SecureRadio,
-    fighter_target: Option<TargetTracker>,
     fighter_target_id: Option<u32>,
     fighter_msgs_received: u32,
     fighter_last_known_target_pos: Option<Vec2>,
@@ -38,19 +39,20 @@ impl Ship {
         // Double the base scan range from 10000.0 to 20000.0
         rc.slice_generator = Box::new(DefaultScanSliceGenerator::new(0.6, 20000.0));
 
-        let missile_radio = SecureRadio::new(1337, 0);
-        let fighter_radio = SecureRadio::new(1337, 4);
+        let radio_manager = Rc::new(RefCell::new(RadioManager::new()));
+        let missile_radio = SecureRadio::new(1337, 0, radio_manager.clone());
+        let fighter_radio = SecureRadio::new(1337, 4, radio_manager);
 
         let mut mg = MissileGuidance::new();
         mg.target_channel = 3;
-        mg.secure_radio = Some(missile_radio);
-        mg.fuel_economy_dv_threshold = 1000.0f64;
+        mg.secure_radio = Some(missile_radio.clone());
+        mg.fuel_economy_vc_threshold = 500.0f64;
 
-        // Pre-tune the radio slot 0 for tick 0 to avoid the 1-tick delay
+        // Pre-tune the radio for tick 0 to avoid the 1-tick delay
         if class() == Class::Fighter {
-            fighter_radio.prepare_receive(0);
+            fighter_radio.prepare_receive();
         } else {
-            missile_radio.prepare_receive(0);
+            missile_radio.prepare_receive();
         }
 
         Ship {
@@ -59,7 +61,6 @@ impl Ship {
             missile_guidance: mg,
             missile_radio,
             fighter_radio,
-            fighter_target: None,
             fighter_target_id: None,
             fighter_msgs_received: 0,
             fighter_last_known_target_pos: None,
@@ -122,7 +123,7 @@ impl Ship {
             // 1. Update radar scheduler and contact database
             self.radar_controller.update();
 
-            let contacts = self.radar_controller.contacts();
+            let contacts = self.radar_controller.contacts().to_vec();
             for c in contacts.iter().filter(|c| c.class == Class::Fighter) {
                 self.fighter_last_known_target_pos = Some(c.current_position());
                 self.fighter_last_known_target_vel = Some(c.current_velocity());
@@ -151,20 +152,17 @@ impl Ship {
                 debug!("FORCE RELOAD ACTIVE: Firing remaining {} bullets to reload", self.bullets_in_magazine);
             }
 
-            // 2. Receive and process fighter radio messages (only if we don't have a target yet)
-            if self.fighter_target.is_none() {
+            if self.fighter_target_id.is_none() {
                 let received = self.fighter_radio.receive();
-                self.fighter_radio.prepare_receive(0);
+                self.fighter_radio.prepare_receive();
 
                 if let Some(payload) = received {
                     self.fighter_msgs_received += 1;
                     let target_idx = (id() as i32) - 2; // Fighter 2 -> 0, Fighter 3 -> 1, Fighter 4 -> 2
                     if target_idx >= 0 && target_idx < 3 && self.fighter_msgs_received == (target_idx + 1) as u32 {
                         let telemetry = TargetTelemetry::deserialize(&payload);
-                        let mut tracker = TargetTracker::new();
-                        tracker.update(current_tick(), telemetry.position, telemetry.velocity);
-                        self.fighter_target = Some(tracker);
-                        self.fighter_target_id = None;
+                        let contact_id = self.radar_controller.add_radio_ping(telemetry);
+                        self.fighter_target_id = Some(contact_id);
                         self.fighter_last_known_target_pos = Some(telemetry.position);
                         self.fighter_last_known_target_vel = Some(telemetry.velocity);
                         debug!("Fighter {} acquired initial target via radio at {:?}", id(), telemetry.position);
@@ -173,46 +171,19 @@ impl Ship {
             }
 
             // 3. Update target tracking
-            let mut target_contact = None;
-
-            if let Some(ref mut tracker) = self.fighter_target {
-                if let Some(tid) = self.fighter_target_id {
-                    target_contact = contacts.iter().find(|c| c.id == tid && c.class == Class::Fighter).cloned();
-                } else {
-                    let (pred_pos, _) = tracker.extrapolate(current_tick());
-                    let mut best_c = None;
-                    let mut min_d = 2000.0;
-                    for c in contacts.iter().filter(|c| c.class == Class::Fighter) {
-                        let d = c.current_position().distance(pred_pos);
-                        if d < min_d {
-                            min_d = d;
-                            best_c = Some(c.clone());
-                        }
-                    }
-                    if let Some(c) = best_c {
-                        let cid = c.id;
-                        self.fighter_target_id = Some(cid);
-                        target_contact = Some(c);
-                        debug!("Fighter {} matched target to radar contact ID {}", id(), cid);
-                    }
-                }
-
-                if let Some(ref c) = target_contact {
-                    tracker.update(current_tick(), c.current_position(), c.current_velocity());
+            if let Some(tid) = self.fighter_target_id {
+                if let Some(c) = contacts.iter().find(|c| c.id == tid && c.class == Class::Fighter) {
                     self.fighter_last_known_target_pos = Some(c.current_position());
                     self.fighter_last_known_target_vel = Some(c.current_velocity());
                 } else {
                     // Target has disappeared. If we previously had it matched, it means it is killed!
-                    if self.fighter_target_id.is_some() {
-                        self.fighter_target = None;
-                        self.fighter_target_id = None;
-                        debug!("Fighter {} target was killed or lost", id());
-                    }
+                    self.fighter_target_id = None;
+                    debug!("Fighter {} target was killed or lost", id());
                 }
             }
 
             // If we don't have a target, try to find one from the radar contacts!
-            if self.fighter_target.is_none() {
+            if self.fighter_target_id.is_none() {
                 let mut best_c = None;
                 let mut min_d = f64::MAX;
                 for c in contacts.iter().filter(|c| c.class == Class::Fighter) {
@@ -223,9 +194,6 @@ impl Ship {
                     }
                 }
                 if let Some(c) = best_c {
-                    let mut tracker = TargetTracker::new();
-                    tracker.update(current_tick(), c.current_position(), c.current_velocity());
-                    self.fighter_target = Some(tracker);
                     self.fighter_target_id = Some(c.id);
                     self.fighter_last_known_target_pos = Some(c.current_position());
                     self.fighter_last_known_target_vel = Some(c.current_velocity());
@@ -234,7 +202,7 @@ impl Ship {
             }
 
             // If target is killed/lost, prioritize closest enemy fighter to the target's last known position
-            if self.fighter_target.is_none() {
+            if self.fighter_target_id.is_none() {
                 if let Some(last_pos) = self.fighter_last_known_target_pos {
                     let mut best_c = None;
                     let mut min_d = f64::MAX;
@@ -246,9 +214,6 @@ impl Ship {
                         }
                     }
                     if let Some(c) = best_c {
-                        let mut tracker = TargetTracker::new();
-                        tracker.update(current_tick(), c.current_position(), c.current_velocity());
-                        self.fighter_target = Some(tracker);
                         self.fighter_target_id = Some(c.id);
                         self.fighter_last_known_target_pos = Some(c.current_position());
                         self.fighter_last_known_target_vel = Some(c.current_velocity());
@@ -413,8 +378,10 @@ impl Ship {
                 debug!("POINT DEFENSE: intercepting incoming missile ID {} in {:.2}s (bullets fired: {})", c.id, best_pd_missile.as_ref().unwrap().1, self.pd_bullets_fired);
             }
 
-            if let Some(ref tracker) = self.fighter_target {
-                let (target_pos, target_vel) = tracker.extrapolate(current_tick());
+            if let Some(contact) = self.fighter_target_id.and_then(|tid| contacts.iter().find(|c| c.id == tid && c.class == Class::Fighter)) {
+                let target_pos = contact.current_position();
+                let target_vel = contact.current_velocity();
+                let target_accel = contact.acceleration;
                 
                 // Calculate target angle for cannon
                 if let Some((time_to_impact, lead_dir)) = predict_lead(
@@ -423,14 +390,14 @@ impl Ship {
                     BULLET_SPEED,
                     target_pos,
                     target_vel,
-                    tracker.acceleration(),
+                    target_accel,
                 ) {
                     let angle = lead_dir.angle();
                     target_angle_now = Some(angle);
 
                     // Draw line to predicted target position (only if we're not aiming at a point-defense threat)
                     if pd_aim_angle.is_none() {
-                        let p_e = target_pos + time_to_impact * target_vel + 0.5 * tracker.acceleration() * time_to_impact * (time_to_impact + TICK_LENGTH);
+                        let p_e = target_pos + time_to_impact * target_vel + 0.5 * target_accel * time_to_impact * (time_to_impact + TICK_LENGTH);
                         draw_line(position(), p_e, rgb(255, 255, 0));
                     }
                 }
@@ -526,18 +493,21 @@ impl Ship {
             // --- Dedicated Missile Telemetry and Firing ---
             let mut current_missile_target = None;
             if let Some(c) = contacts.iter().find(|c| c.class == Class::Fighter) {
-                current_missile_target = Some((c.current_position(), c.current_velocity()));
+                current_missile_target = Some((c.current_position(), c.current_velocity(), c.rssi as f32, c.class));
             } else if let Some(last_pos) = self.fighter_last_known_target_pos {
                 let last_vel = self.fighter_last_known_target_vel.unwrap_or(Vec2::new(0.0, 0.0));
-                current_missile_target = Some((last_pos, last_vel));
+                current_missile_target = Some((last_pos, last_vel, 0.0f32, Class::Fighter));
             }
 
-            if let Some((m_pos, m_vel)) = current_missile_target {
+            if let Some((m_pos, m_vel, m_rssi, m_class)) = current_missile_target {
                 let telemetry = TargetTelemetry {
                     position: m_pos,
                     velocity: m_vel,
+                    rssi: m_rssi,
+                    class: m_class,
+                    tick: current_tick() as u8,
                 };
-                self.missile_radio.transmit(0, telemetry.serialize());
+                self.missile_radio.transmit(telemetry.serialize());
 
                 if reload_ticks(1) == 0 {
                     fire(1);
