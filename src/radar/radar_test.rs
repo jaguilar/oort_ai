@@ -4,11 +4,7 @@ use super::*;
 fn test_kalman_filter() {
     let mut contact = Contact {
         id: 0,
-        class: Class::Fighter,
-        position: Vec2::new(0.0, 0.0),
-        velocity: Vec2::new(10.0, 0.0),
-        acceleration: Vec2::new(0.0, 0.0),
-        last_scanned: 0,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 0.0), 0),
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 20.0,
@@ -69,11 +65,7 @@ fn test_kalman_filter() {
 fn test_radar_clamped_tracking_width() {
     let contact = Contact {
         id: 0,
-        class: Class::Fighter,
-        position: Vec2::new(0.0, 0.0),
-        velocity: Vec2::new(0.0, 0.0),
-        acceleration: Vec2::new(0.0, 0.0),
-        last_scanned: 0,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 100.0,
@@ -105,11 +97,7 @@ fn test_radar_clamped_tracking_width() {
 fn test_radar_out_of_range_retained() {
     let contact_close = Contact {
         id: 1,
-        class: Class::Fighter,
-        position: Vec2::new(0.0, 1000.0),
-        velocity: Vec2::new(0.0, 0.0),
-        acceleration: Vec2::new(0.0, 0.0),
-        last_scanned: 0,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 1000.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 10.0,
@@ -125,11 +113,7 @@ fn test_radar_out_of_range_retained() {
 
     let contact_far = Contact {
         id: 2,
-        class: Class::Fighter,
-        position: Vec2::new(0.0, 200000.0),
-        velocity: Vec2::new(0.0, 0.0),
-        acceleration: Vec2::new(0.0, 0.0),
-        last_scanned: 0,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 200000.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 10.0,
@@ -213,11 +197,7 @@ fn test_nearby_contact_exclusion() {
     // Target contact at (1000.0, 0.0)
     let target = Contact {
         id: 1,
-        class: Class::Fighter,
-        position: Vec2::new(1000.0, 0.0),
-        velocity: Vec2::new(0.0, 0.0),
-        acceleration: Vec2::new(0.0, 0.0),
-        last_scanned: 0,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 10.0,
@@ -244,11 +224,7 @@ fn test_nearby_contact_exclusion() {
     // Let's place it at (1000.0, 30.0), so angle is approx 0.03 rad.
     let left_contact = Contact {
         id: 2,
-        class: Class::Fighter,
-        position: Vec2::new(1000.0, 30.0),
-        velocity: Vec2::new(0.0, 0.0),
-        acceleration: Vec2::new(0.0, 0.0),
-        last_scanned: 0,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 30.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 1.0,

@@ -1,4 +1,5 @@
 pub mod control;
+pub mod missile;
 pub mod radar;
 pub mod tutorial_guns;
 pub mod tutorial_rotation;
@@ -14,3 +15,7 @@ pub mod mission_gunnery;
 pub mod mission_cruiser_defense;
 pub mod radio;
 pub mod fighter_duel;
+pub mod fighter;
+pub mod cruiser;
+pub mod physics;
+pub mod aim;

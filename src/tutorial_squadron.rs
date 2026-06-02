@@ -1,5 +1,6 @@
 use oort_api::prelude::*;
-use crate::control::{quick_turn_with_target_omega, predict_lead, MissileGuidance};
+use crate::control::{quick_turn_with_target_omega, predict_lead};
+use crate::missile::MissileGuidance;
 use crate::radar::Contact;
 
 pub struct Ship {

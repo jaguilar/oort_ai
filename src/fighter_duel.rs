@@ -1,7 +1,8 @@
 use oort_api::prelude::*;
 use std::rc::Rc;
 use std::cell::RefCell;
-use crate::control::{quick_turn_with_target_omega, predict_lead, AngleTracker, MissileGuidance, TargetTelemetry};
+use crate::control::{quick_turn_with_target_omega, predict_lead, AngleTracker};
+use crate::missile::{MissileGuidance, TargetTelemetry};
 use crate::radar::{RadarController, DefaultScanSliceGenerator, Contact};
 use crate::radio::{SecureRadio, RadioManager};
 

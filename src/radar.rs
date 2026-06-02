@@ -1,5 +1,6 @@
 use oort_api::prelude::*;
-use crate::control::TargetTelemetry;
+use crate::missile::TargetTelemetry;
+use crate::physics::KinematicState;
 
 pub const RADIO_PING_SNR: f64 = 25.0;
 
@@ -56,12 +57,7 @@ fn is_within_range(contact: &Contact, d: f64) -> bool {
 #[derive(Clone, Debug)]
 pub struct Contact {
     pub id: u32,
-    pub class: Class,
-    // The following fields represent the last ground truth measurement from a scan:
-    pub position: Vec2,
-    pub velocity: Vec2,
-    pub acceleration: Vec2,
-    pub last_scanned: u32,
+    pub kinematic: KinematicState,
     pub rssi: f64,
     pub snr: f64,
     pub pos_uncertainty: f64,
@@ -73,6 +69,19 @@ pub struct Contact {
     pub unscanned_in_range_ticks: u32,
     pub p_cov_x: [[f64; 3]; 3],
     pub p_cov_y: [[f64; 3]; 3],
+}
+
+impl std::ops::Deref for Contact {
+    type Target = KinematicState;
+    fn deref(&self) -> &Self::Target {
+        &self.kinematic
+    }
+}
+
+impl std::ops::DerefMut for Contact {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.kinematic
+    }
 }
 
 impl Contact {
@@ -93,13 +102,11 @@ impl Contact {
     }
 
     pub fn position_at(&self, tick: u32) -> Vec2 {
-        let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
-        self.position + self.velocity * dt + 0.5 * self.acceleration * dt * (dt + TICK_LENGTH)
+        self.kinematic.position_at(tick)
     }
 
     pub fn velocity_at(&self, tick: u32) -> Vec2 {
-        let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
-        self.velocity + self.acceleration * dt
+        self.kinematic.velocity_at(tick)
     }
 
     pub fn pos_uncertainty_at(&self, tick: u32) -> f64 {
@@ -527,11 +534,7 @@ impl RadarController {
                 let new_id = self.next_contact_id;
                 self.contacts.push(Contact {
                     id: new_id,
-                    class: c.class,
-                    position: c.position,
-                    velocity: c.velocity,
-                    acceleration: Vec2::new(0.0, 0.0),
-                    last_scanned,
+                    kinematic: KinematicState::new(c.class, c.position, c.velocity, Vec2::new(0.0, 0.0), last_scanned),
                     rssi: c.rssi,
                     snr: c.snr,
                     pos_uncertainty: pos_unc,
@@ -626,7 +629,6 @@ impl RadarController {
 
                     for contact in &self.contacts {
                         if contact.class != c.class {
-                            debug!("{} not same class ({:?} vs. {:?})", contact.id, contact.class, c.class);
                             continue;
                         }
                         let expected_pos = contact.current_position();
@@ -772,11 +774,7 @@ impl RadarController {
 
                             self.contacts.push(Contact {
                                 id: self.next_contact_id,
-                                class: c.class,
-                                position: c.position,
-                                velocity: c.velocity,
-                                acceleration: Vec2::new(0.0, 0.0),
-                                last_scanned,
+                                kinematic: KinematicState::new(c.class, c.position, c.velocity, Vec2::new(0.0, 0.0), last_scanned),
                                 rssi: c.rssi,
                                 snr: c.snr,
                                 pos_uncertainty: pos_unc,

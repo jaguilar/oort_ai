@@ -1,5 +1,6 @@
 use oort_api::prelude::*;
-use crate::control::{quick_turn_with_target_omega, AngleTracker, MissileGuidance};
+use crate::control::{quick_turn_with_target_omega, AngleTracker};
+use crate::missile::MissileGuidance;
 use crate::radar::RadarController;
 
 struct ExpectedIntercept {
