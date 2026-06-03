@@ -7,6 +7,8 @@ use crate::physics::KinematicState;
 use crate::aim::{AimAt, GunAimer};
 
 const GUN_AIMER: GunAimer = GunAimer::new(Vec2 { x: 20.0, y: 0.0 }, 1000.0);
+const ORBIT_CHANGE_MIN: f64 = 5.0;
+const ORBIT_CHANGE_MAX: f64 = 10.0;
 
 pub struct Fighter {
     radar_controller: RadarController,
@@ -144,11 +146,10 @@ impl Fighter {
                 let margin = 0.90; // Reserve 10% of acceleration for radial/tangential control
                 let target_speed = (r_orbit * max_acc * margin).sqrt();
 
-                // Periodic orbit direction change (randomly between 7.0 and 13.0 seconds)
                 let ticks_since_change = current_tick() - self.last_orbit_direction_change_tick;
                 if ticks_since_change >= self.current_period_ticks {
                     self.orbit_direction = -self.orbit_direction;
-                    let t_seconds = rand(13.0, 17.0);
+                    let t_seconds = rand(ORBIT_CHANGE_MIN, ORBIT_CHANGE_MAX);
                     self.current_period_ticks = (t_seconds / TICK_LENGTH).round() as u32;
                     self.last_orbit_direction_change_tick = current_tick();
                     self.num_direction_changes += 1;

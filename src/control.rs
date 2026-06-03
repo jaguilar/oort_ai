@@ -440,66 +440,7 @@ impl AngleTracker {
 }
 
 
-/// Calculates the optimal direct angular acceleration (torque) required to turn to face a target point
-/// in the minimum amount of time, taking into account target and self velocities to compute the
-/// exact relative angular velocity (line-of-sight rate) with zero lag.
-pub fn optimal_turn_torque(
-    our_pos: Vec2,
-    our_vel: Vec2,
-    target_pos: Vec2,
-    target_vel: Option<Vec2>,
-) -> f64 {
-    let r = target_pos - our_pos;
-    let v_rel = target_vel.unwrap_or(Vec2::new(0.0, 0.0)) - our_vel;
-    let target_angle = r.angle();
-    let r_len_sq = r.dot(r);
-    let target_omega = if r_len_sq > 1e-6 {
-        (r.x * v_rel.y - r.y * v_rel.x) / r_len_sq
-    } else {
-        0.0
-    };
 
-    let difference = angle_diff(heading(), target_angle);
-    let omega = angular_velocity();
-    let max_ang_accel = max_angular_acceleration();
-
-    let unaccelerated_next_heading = heading() + omega * TICK_LENGTH;
-    let diff_next = angle_diff(unaccelerated_next_heading, target_angle);
-    let speed_diff = (omega - target_omega).abs();
-
-    if diff_next.abs() <= max_ang_accel * TICK_LENGTH * TICK_LENGTH
-        && speed_diff <= max_ang_accel * TICK_LENGTH
-    {
-        let alpha_req = diff_next / (TICK_LENGTH * TICK_LENGTH);
-        return alpha_req.clamp(-max_ang_accel, max_ang_accel);
-    }
-
-    let a_dec = max_ang_accel * 0.98;
-    let k_p = 10.0;
-    let theta_trans = a_dec / (k_p * k_p);
-    let theta_offset = theta_trans / 2.0;
-
-    let omega_target_static = if difference.abs() <= theta_trans {
-        k_p * difference
-    } else {
-        difference.signum() * (2.0 * a_dec * (difference.abs() - theta_offset)).sqrt()
-    };
-
-    let is_decelerating = difference * (omega - target_omega) > 0.0
-        && (omega - target_omega).abs() > omega_target_static.abs()
-        && difference.abs() > theta_trans;
-
-    let alpha_req = if is_decelerating {
-        let s = difference.signum();
-        let diff_adjusted = difference.abs() - theta_offset;
-        ( (target_omega - omega) - a_dec * s * TICK_LENGTH - s * (a_dec * (2.0 * diff_adjusted + a_dec * TICK_LENGTH * TICK_LENGTH)).sqrt() ) / TICK_LENGTH
-    } else {
-        let omega_target = omega_target_static + target_omega;
-        (omega_target - omega) / TICK_LENGTH
-    };
-    
-    alpha_req.clamp(-max_ang_accel, max_ang_accel)
-}
 
 /// Estimates the time to complete a turn to face a target angle and match target angular velocity,
 /// assuming we use the quick_turn_torque_with_target_omega controller.

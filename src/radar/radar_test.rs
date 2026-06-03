@@ -243,3 +243,40 @@ fn test_nearby_contact_exclusion() {
     // Because of the left contact, the beam should shift clockwise (to the right, i.e. negative angle).
     assert!(job2.angle < 0.0, "Beam should shift to the right, angle = {}", job2.angle);
 }
+
+#[test]
+fn test_radar_pings_reliable_range() {
+    let mut rc = RadarController::new();
+
+    // Max range calculations for Fighter in tests (power=100e3, rx_xs=10.0, rcs=10.0):
+    // reliable_rssi = 1e-12
+    // If slice_width = 0.6: max_range ~ 40327m
+    // If slice_width = 0.05: max_range ~ 75056m
+
+    // A detection at 50000m (outside reliable range at 0.6, inside at 0.05)
+    let scan_hit = ScanResult {
+        position: Vec2::new(50000.0, 0.0),
+        velocity: Vec2::new(0.0, 0.0),
+        class: Class::Fighter,
+        rssi: 1e-11,
+        snr: 25.0,
+    };
+
+    // 1. Scan with slice_width = 0.6: should NOT add a new contact (returns 0, contacts.len() is 0)
+    let id1 = rc.process_scan_hit(scan_hit.clone(), Some(0.6));
+    assert_eq!(id1, 0);
+    assert!(rc.contacts.is_empty());
+
+    // 2. Scan with slice_width = 0.05: should successfully add a new contact (returns id > 0, contacts.len() is 1)
+    let id2 = rc.process_scan_hit(scan_hit.clone(), Some(0.05));
+    assert!(id2 > 0);
+    assert_eq!(rc.contacts.len(), 1);
+    assert_eq!(rc.contacts[0].id, id2);
+
+    // 3. Scan with slice_width = None (e.g. radio ping): should successfully add a new contact even if far away
+    let mut rc2 = RadarController::new();
+    let id3 = rc2.process_scan_hit(scan_hit.clone(), None);
+    assert!(id3 > 0);
+    assert_eq!(rc2.contacts.len(), 1);
+}
+

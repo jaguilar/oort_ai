@@ -46,3 +46,17 @@ impl KinematicState {
         self.velocity + self.acceleration * dt
     }
 }
+
+pub fn max_acceleration_over_time(class: Class, t_go: f64) -> f64 {
+    let stats = class.default_stats();
+    let base_accel = stats.max_forward_acceleration
+        .max(stats.max_backward_acceleration)
+        .max(stats.max_lateral_acceleration);
+    let boost_dv = if class == Class::Fighter || class == Class::Missile {
+        (t_go / 10.0).ceil() * 100.0
+    } else {
+        0.0
+    };
+    base_accel + boost_dv / t_go.max(1e-6)
+}
+

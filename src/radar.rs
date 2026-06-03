@@ -53,6 +53,14 @@ fn is_within_range(contact: &Contact, d: f64) -> bool {
     d <= max_range
 }
 
+fn is_within_reliable_range(class: Class, d: f64, slice_width: f64) -> bool {
+    let (power, rx_xs) = own_radar_properties();
+    let rcs = target_rcs(class);
+    let reliable_rssi = 1e-12; // -90 dBm
+    let max_range = ((power * rcs * rx_xs) / (slice_width * std::f64::consts::TAU * reliable_rssi)).powf(0.25);
+    d <= max_range
+}
+
 
 #[derive(Clone, Debug)]
 pub struct Contact {
@@ -451,10 +459,10 @@ impl RadarController {
             rssi: telemetry.rssi as f64,
             snr: RADIO_PING_SNR,
         };
-        self.process_scan_hit(c)
+        self.process_scan_hit(c, None)
     }
 
-    pub fn process_scan_hit(&mut self, c: ScanResult) -> u32 {
+    pub fn process_scan_hit(&mut self, c: ScanResult, slice_width: Option<f64>) -> u32 {
         let current_t = current_tick();
         let mut best_match: Option<&mut Contact> = None;
         let mut best_dist = f64::MAX;
@@ -526,6 +534,11 @@ impl RadarController {
             if let Some(existing) = preexisting {
                 existing.id
             } else {
+                if let Some(w) = slice_width {
+                    if !is_within_reliable_range(c.class, dist, w) {
+                        return 0;
+                    }
+                }
                 let vel_unc = 100.0 * error_factor;
                 let last_scanned = current_t;
                 let cov_x = Contact::initial_cov(pos_unc, vel_unc, c.class);
@@ -619,9 +632,10 @@ impl RadarController {
         for (i, c) in scan_results {
             select_radar(i);
             let state = self.radar_states[i];
+            let slice_width = self.prev_slices[i].map(|s| s.width);
             match state {
                 RadarState::Scanning => {
-                    self.process_scan_hit(c);
+                    self.process_scan_hit(c, slice_width);
                 }
                 RadarState::Tracking { contact_id } => {
                     let mut best_match_id = None;
@@ -756,38 +770,48 @@ impl RadarController {
                         // Create a new contact
                         let error_factor = 10.0f64.powf(-c.snr / 10.0);
                         let dist = position().distance(c.position);
-                        let sigma_r = 10000.0 * error_factor;
-                        let sigma_theta = (10.0 * (TAU / 360.0)) * error_factor;
-                        let pos_unc = sigma_r.max(dist * sigma_theta.min(radar_width() / 2.0));
-                        let ci_radius = 3.89 * pos_unc;
 
-                        let includes_preexisting = self.contacts.iter().any(|co| {
-                            co.class == c.class && co.current_position().distance(c.position) <= ci_radius
-                        });
+                        let mut should_add = true;
+                        if let Some(w) = slice_width {
+                            if !is_within_reliable_range(c.class, dist, w) {
+                                should_add = false;
+                            }
+                        }
 
-                        if !includes_preexisting {
-                            let vel_unc = 100.0 * error_factor;
-                            let last_scanned = current_t;
+                        if should_add {
+                            let sigma_r = 10000.0 * error_factor;
+                            let sigma_theta = (10.0 * (TAU / 360.0)) * error_factor;
+                            let pos_unc = sigma_r.max(dist * sigma_theta.min(radar_width() / 2.0));
+                            let ci_radius = 3.89 * pos_unc;
 
-                            let cov_x = Contact::initial_cov(pos_unc, vel_unc, c.class);
-                            let cov_y = Contact::initial_cov(pos_unc, vel_unc, c.class);
-
-                            self.contacts.push(Contact {
-                                id: self.next_contact_id,
-                                kinematic: KinematicState::new(c.class, c.position, c.velocity, Vec2::new(0.0, 0.0), last_scanned),
-                                rssi: c.rssi,
-                                snr: c.snr,
-                                pos_uncertainty: pos_unc,
-                                vel_uncertainty: vel_unc,
-                                radar_locked: true,
-                                provisional: true,
-                                tracking_retry_count: 0,
-                                confirmation_attempts: 0,
-                                unscanned_in_range_ticks: 0,
-                                p_cov_x: cov_x,
-                                p_cov_y: cov_y,
+                            let includes_preexisting = self.contacts.iter().any(|co| {
+                                co.class == c.class && co.current_position().distance(c.position) <= ci_radius
                             });
-                            self.next_contact_id += 1;
+
+                            if !includes_preexisting {
+                                let vel_unc = 100.0 * error_factor;
+                                let last_scanned = current_t;
+
+                                let cov_x = Contact::initial_cov(pos_unc, vel_unc, c.class);
+                                let cov_y = Contact::initial_cov(pos_unc, vel_unc, c.class);
+
+                                self.contacts.push(Contact {
+                                    id: self.next_contact_id,
+                                    kinematic: KinematicState::new(c.class, c.position, c.velocity, Vec2::new(0.0, 0.0), last_scanned),
+                                    rssi: c.rssi,
+                                    snr: c.snr,
+                                    pos_uncertainty: pos_unc,
+                                    vel_uncertainty: vel_unc,
+                                    radar_locked: true,
+                                    provisional: true,
+                                    tracking_retry_count: 0,
+                                    confirmation_attempts: 0,
+                                    unscanned_in_range_ticks: 0,
+                                    p_cov_x: cov_x,
+                                    p_cov_y: cov_y,
+                                });
+                                self.next_contact_id += 1;
+                            }
                         }
                     }
 
@@ -858,7 +882,7 @@ impl RadarController {
         let mut tracking_contacts = Vec::new();
         for contact in &self.contacts {
             let is_priority = self.priority_targets.contains(&contact.id) || contact.provisional;
-            let interval = if is_priority { self.priority_track_interval } else { 30 };
+            let interval = if is_priority { self.priority_track_interval } else { 20 };
             let next_track_tick = if contact.provisional {
                 current_t
             } else {
