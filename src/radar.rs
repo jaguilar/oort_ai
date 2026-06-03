@@ -488,7 +488,7 @@ impl RadarController {
             }
         }
 
-        if let Some(contact) = best_match {
+        let returned_id = if let Some(contact) = best_match {
             let ci_radius = 3.89 * contact.current_pos_uncertainty();
             if best_dist > ci_radius.max(10.0) && best_dist > 20.0 {
                 let stats = contact.class.default_stats();
@@ -563,7 +563,20 @@ impl RadarController {
                 self.next_contact_id += 1;
                 new_id
             }
-        }
+        };
+
+        // Immediately remove enemy missiles or torpedoes moving away from us
+        self.contacts.retain(|contact| {
+            if contact.class == Class::Missile || contact.class == Class::Torpedo {
+                let r = contact.current_position() - position();
+                let v_rel = contact.current_velocity() - velocity();
+                r.dot(v_rel) <= 0.0
+            } else {
+                true
+            }
+        });
+
+        returned_id
     }
 
     pub fn set_tracking_width(&mut self, width: f64) {
@@ -853,6 +866,17 @@ impl RadarController {
                 }
             }
         }
+
+        // Immediately remove enemy missiles or torpedoes moving away from us
+        self.contacts.retain(|contact| {
+            if contact.class == Class::Missile || contact.class == Class::Torpedo {
+                let r = contact.current_position() - position();
+                let v_rel = contact.current_velocity() - velocity();
+                r.dot(v_rel) <= 0.0
+            } else {
+                true
+            }
+        });
 
         // 2.5. Prune tracked contacts that were not updated this tick by either physical radar or radio telemetry,
         // but only if they have failed tracking too many times (tracking_retry_count >= 3).

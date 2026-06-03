@@ -714,7 +714,7 @@ impl MissileGuidance {
                 let safety_buffer = self.turn_safety_buffer_ticks * TICK_LENGTH;
                 let turn_time_with_buffer = turn_time + safety_buffer;
 
-                if time_until_explosion <= turn_time_with_buffer {
+                if time_until_explosion <= turn_time_with_buffer || time_until_explosion < 0.5 {
                     let r = target_pos_at_explosion - position();
                     let target_angle = r.angle();
                     let r_len_sq = r.dot(r);
@@ -723,6 +723,13 @@ impl MissileGuidance {
                     } else {
                         0.0
                     };
+                    let torque_val = crate::control::quick_turn_torque_with_target_omega(target_angle, target_omega);
+                    debug!("Terminal Turn:");
+                    debug!("  Target Angle: {} deg", target_angle.to_degrees().round() as i32);
+                    debug!("  Current Heading: {} deg", heading().to_degrees().round() as i32);
+                    debug!("  Target Omega: {} deg/s", target_omega.to_degrees().round() as i32);
+                    debug!("  Current Omega: {} deg/s", angular_velocity().to_degrees().round() as i32);
+                    debug!("  Torque: {} deg/s^2", torque_val.to_degrees().round() as i32);
                     quick_turn_with_target_omega(target_angle, target_omega);
                 } else {
                     quick_turn(a_total.angle());
@@ -734,10 +741,6 @@ impl MissileGuidance {
                 let is_terminal = time_until_explosion <= turn_time_with_buffer;
                 let mode = self.determine_guidance_mode(true, is_terminal, fuel_economy);
                 debug!("Mode: {}", mode);
-                debug!("Acc X: {:.2}", a_total.x);
-                debug!("Acc Y: {:.2}", a_total.y);
-                debug!("Lat Acc X: {:.2}, Y: {:.2}", a_lateral.x, a_lateral.y);
-                debug!("Fwd Acc X: {:.2}, Y: {:.2}", (dir * forward_acc).x, (dir * forward_acc).y);
 
                 // Boost should only be used while the target-direction acceleration vector component is greater than 100 m/s^2
                 // and the missile is aimed toward the direction it is trying to accelerate in.
@@ -816,8 +819,6 @@ impl MissileGuidance {
 
                 let mode = self.determine_guidance_mode(false, false, false);
                 debug!("Mode: {}", mode);
-                debug!("Acc X: {:.2}", a_total.x);
-                debug!("Acc Y: {:.2}", a_total.y);
             } else {
                 // No target - burn straight ahead at maximum speed until we find a lock, provided we retain fuel
                 let mode = self.determine_guidance_mode(false, false, false);
@@ -828,8 +829,6 @@ impl MissileGuidance {
                     vec2(0.0, 0.0)
                 };
                 debug!("Mode: {}", mode);
-                debug!("Acc X: {:.2}", a_cmd.x);
-                debug!("Acc Y: {:.2}", a_cmd.y);
 
                 accelerate(a_cmd);
                 deactivate_ability(Ability::Boost);

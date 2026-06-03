@@ -280,3 +280,67 @@ fn test_radar_pings_reliable_range() {
     assert_eq!(rc2.contacts.len(), 1);
 }
 
+#[test]
+fn test_radar_prunes_moving_away_missiles_and_torpedoes() {
+    let mut rc = RadarController::new();
+
+    // 1. Incoming missile: pos = (100, 0), vel = (-10, 0)
+    let m_incoming = ScanResult {
+        position: Vec2::new(100.0, 0.0),
+        velocity: Vec2::new(-10.0, 0.0),
+        class: Class::Missile,
+        rssi: -50.0,
+        snr: 25.0,
+    };
+
+    // 2. Moving-away missile: pos = (500, 0), vel = (10, 0)
+    let m_away = ScanResult {
+        position: Vec2::new(500.0, 0.0),
+        velocity: Vec2::new(10.0, 0.0),
+        class: Class::Missile,
+        rssi: -50.0,
+        snr: 25.0,
+    };
+
+    // 3. Incoming torpedo: pos = (200, 0), vel = (-5, 0)
+    let t_incoming = ScanResult {
+        position: Vec2::new(200.0, 0.0),
+        velocity: Vec2::new(-5.0, 0.0),
+        class: Class::Torpedo,
+        rssi: -50.0,
+        snr: 25.0,
+    };
+
+    // 4. Moving-away torpedo: pos = (600, 0), vel = (5, 0)
+    let t_away = ScanResult {
+        position: Vec2::new(600.0, 0.0),
+        velocity: Vec2::new(5.0, 0.0),
+        class: Class::Torpedo,
+        rssi: -50.0,
+        snr: 25.0,
+    };
+
+    // 5. Moving-away fighter (should NOT be pruned): pos = (300, 0), vel = (20, 0)
+    let f_away = ScanResult {
+        position: Vec2::new(300.0, 0.0),
+        velocity: Vec2::new(20.0, 0.0),
+        class: Class::Fighter,
+        rssi: -50.0,
+        snr: 25.0,
+    };
+
+    // Add them to the radar controller using process_scan_hit
+    let id_m_in = rc.process_scan_hit(m_incoming, None);
+    let id_m_away = rc.process_scan_hit(m_away, None);
+    let id_t_in = rc.process_scan_hit(t_incoming, None);
+    let id_t_away = rc.process_scan_hit(t_away, None);
+    let id_f_away = rc.process_scan_hit(f_away, None);
+
+    // Verify which ones are kept
+    assert!(rc.has_contact(id_m_in));
+    assert!(!rc.has_contact(id_m_away));
+    assert!(rc.has_contact(id_t_in));
+    assert!(!rc.has_contact(id_t_away));
+    assert!(rc.has_contact(id_f_away));
+}
+

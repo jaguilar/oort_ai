@@ -5,7 +5,7 @@ use crate::control::quick_turn_with_target_omega;
 use crate::missile::{MissileGuidance, TargetTelemetry, MissileMessage, LoiterCommand};
 
 const SALVO_SIZE: usize = 2;
-const FIRST_MISSILE_CRUISE_SPEED: f64 = 1000.0;
+const FIRST_MISSILE_CRUISE_SPEED: f64 = 750.0;
 use crate::radar::{RadarController, DefaultScanSliceGenerator, Contact, ScanSliceGenerator, ScanSlice};
 use crate::radio::{SecureRadio, RadioManager};
 use crate::aim::{AimAt, GunAimer};
@@ -383,21 +383,20 @@ impl Ship {
             // Velocity-based orbit direction change: reverse direction when we reach
             // a random fraction of our max orbital velocity (between 0.5 and 0.95).
             // Don't start reversing our direction until we're near the circle.
-            if near_circle {
-                let t = vec2(-u.y, u.x) * self.orbit_direction;
-                let v_t = vel.dot(t);
-                if v_t >= self.target_orbit_speed_fraction * target_speed {
-                    self.orbit_direction = -self.orbit_direction;
-                    self.target_orbit_speed_fraction = rand(0.5, 0.95);
-                    self.num_direction_changes += 1;
-                    self.ticks_since_reversal = 0;
-                    debug!("Velocity-based change (near circle): Orbit direction reversed to {}. New fraction threshold: {:.2}",
-                           self.orbit_direction, self.target_orbit_speed_fraction);
-                }
+            let t = vec2(-u.y, u.x) * self.orbit_direction;
+            let v_t = vel.dot(t);
+            if v_t >= self.target_orbit_speed_fraction * target_speed || (current_tick() == 400 && self.ticks_since_reversal >= 150) {
+                self.orbit_direction = -self.orbit_direction;
+                self.target_orbit_speed_fraction = rand(0.5, 0.95);
+                self.num_direction_changes += 1;
+                self.ticks_since_reversal = 0;
+                debug!("Velocity-based change (near circle): Orbit direction reversed to {}. New fraction threshold: {:.2}",
+                        self.orbit_direction, self.target_orbit_speed_fraction);
             }
 
+
             let t = vec2(-u.y, u.x) * self.orbit_direction;
-            let is_reversing_orbit = self.ticks_since_reversal < 300 && vel.dot(t) < target_speed - 50.0;
+            let is_reversing_orbit = self.ticks_since_reversal < 300 && vel.dot(t) < target_speed;
 
             // Calculate desired acceleration for movement based on zone
             let mut acc_cmd;
@@ -559,7 +558,7 @@ impl Ship {
                         let t_travel = d / FIRST_MISSILE_CRUISE_SPEED;
                         let vel_len = tk.velocity.length();
                         let dir_course = if vel_len > 1e-6 { tk.velocity / vel_len } else { vec2(1.0, 0.0) };
-                        let offset_dist = rand(-2000.0, 2000.0);
+                        let offset_dist = rand(-1000.0, 4000.0);
                         let aim_pt = tk.position + dir_course * offset_dist;
 
                         self.salvo_aim_point = Some(aim_pt);
