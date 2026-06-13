@@ -1,8 +1,65 @@
 use oort_api::prelude::*;
 use std::rc::Rc;
 use std::cell::RefCell;
-use crate::control::quick_turn_with_target_omega;
+use crate::control::{quick_turn_with_target_omega, quick_turn_time_with_target_omega};
 use crate::missile::{MissileGuidance, TargetTelemetry};
+
+pub struct FireControl {
+    gun_id: usize,
+    magazine_size: u32,
+    bullets_in_magazine: u32,
+    reload_ticks_fn: fn(usize) -> u32,
+}
+
+impl FireControl {
+    pub fn from_gun(id: i32) -> Self {
+        Self::new(id, reload_ticks)
+    }
+
+    pub fn new(id: i32, reload_ticks_fn: fn(usize) -> u32) -> Self {
+        match id {
+            0 => Self {
+                gun_id: 0,
+                magazine_size: 30,
+                bullets_in_magazine: 30,
+                reload_ticks_fn,
+            },
+            1 => Self {
+                gun_id: 1,
+                magazine_size: 1,
+                bullets_in_magazine: 1,
+                reload_ticks_fn,
+            },
+            _ => panic!("Unsupported gun id: {}", id),
+        }
+    }
+
+    pub fn fire(&mut self) {
+        if (self.reload_ticks_fn)(self.gun_id) == 0 {
+            fire(self.gun_id);
+            let current_bullets = self.bullets_in_magazine();
+            self.bullets_in_magazine = current_bullets.saturating_sub(1);
+        }
+    }
+
+    pub fn reload_time(&self) -> f64 {
+        ((self.reload_ticks_fn)(self.gun_id) as f64) * TICK_LENGTH
+    }
+
+    pub fn bullets_in_magazine(&self) -> u32 {
+        let r_ticks = (self.reload_ticks_fn)(self.gun_id);
+
+        if self.bullets_in_magazine == 0 {
+            if r_ticks > 0 {
+                0
+            } else {
+                self.magazine_size
+            }
+        } else {
+            self.bullets_in_magazine
+        }
+    }
+}
 
 const SALVO_SIZE: usize = 2;
 const FIRST_MISSILE_CRUISE_SPEED: f64 = 750.0;
@@ -72,12 +129,82 @@ impl ScanSliceGenerator for BiasedScanSliceGenerator {
 }
 
 
+fn can_missile_intercept(missile: &KinematicState, target: &KinematicState) -> bool {
+    let t_now = current_tick();
+    
+    // Extrapolate the missile's position and velocity to the current tick,
+    // using its scanned acceleration to account for movement and acceleration between scans.
+    let missile_pos = missile.position_at(t_now);
+    let missile_vel = missile.velocity_at(t_now);
+
+    let r0_vec = target.position - missile_pos;
+    let r0 = r0_vec.length();
+    if r0 < 1e-6 {
+        return true;
+    }
+
+    let u0 = r0_vec / r0;
+    let w0 = Vec2::new(-u0.y, u0.x);
+    let v_rel = target.velocity - missile_vel;
+    let v_c = -v_rel.dot(u0);
+
+    if v_c <= 0.0 {
+        return false;
+    }
+
+    let t_go = r0 / v_c;
+
+    let missile_stats = Class::Missile.default_stats();
+    let max_lat_acc = missile_stats.max_lateral_acceleration;
+
+    let v_rel_perp = v_rel.dot(w0);
+    let d_steer = v_rel_perp.abs() * t_go;
+
+    // Calculate max bullet displacement at t_go factoring in detonation 0.2s before impact
+    let d_max = if t_go > 0.2 {
+        0.5 * max_lat_acc * (t_go - 0.2).powi(2) + 100.0
+    } else {
+        500.0 * t_go
+    };
+
+    let is_threat = d_max >= d_steer;
+
+    // --- Diagnostic Debug Drawings ---
+    // The center of the missile's steerable zone is its ballistic trajectory (no lateral thrust)
+    let p_missile_center = missile_pos + missile_vel * t_go;
+    let p_target = target.position + target.velocity * t_go;
+
+    // Draw ballistic path in orange
+    draw_line(missile_pos, p_missile_center, rgb(255, 128, 0));
+    // Draw target path in yellow
+    draw_line(target.position, p_target, rgb(255, 255, 0));
+
+    // Draw steerable zone circle (including bullet spread) centered at p_missile_center in green
+    draw_polygon(p_missile_center, d_max, 32, 0.0, rgb(0, 255, 0));
+
+    if is_threat {
+        // Draw threat line in red
+        draw_line(missile_pos, p_target, rgb(255, 0, 0));
+        draw_diamond(p_target, 20.0, rgb(255, 0, 0));
+        draw_text!(missile_pos + vec2(0.0, 30.0), rgb(255, 0, 0), "THREAT t_go:{:.1}s d_steer:{:.1} d_max:{:.1}", t_go, d_steer, d_max);
+    } else {
+        // Draw safe line in green
+        draw_line(missile_pos, p_target, rgb(0, 255, 0));
+        draw_diamond(p_target, 15.0, rgb(0, 255, 0));
+        draw_text!(missile_pos + vec2(0.0, 30.0), rgb(0, 255, 0), "SAFE t_go:{:.1}s d_steer:{:.1} d_max:{:.1}", t_go, d_steer, d_max);
+    }
+
+    is_threat
+}
+
+
 pub fn filter_missile_threats(
     contacts: &[Contact],
     our_pos: Vec2,
     our_vel: Vec2,
 ) -> Vec<u32> {
     let mut missile_threats = Vec::new();
+    let our_kin = KinematicState::new(Class::Fighter, our_pos, our_vel, Vec2::new(0.0, 0.0), current_tick());
     for c in contacts.iter().filter(|c| c.class == Class::Missile) {
         let r = c.current_position() - our_pos;
         let dist = r.length();
@@ -85,14 +212,16 @@ pub fn filter_missile_threats(
             let v_rel = c.current_velocity() - our_vel;
             let closing = -r.dot(v_rel) / dist;
             if closing > 0.0 {
-                let v_rel_len_sq = v_rel.dot(v_rel);
-                if v_rel_len_sq > 0.0 {
-                    let t_closest = -r.dot(v_rel) / v_rel_len_sq;
-                    if t_closest > 0.0 && t_closest <= 5.0 {
-                        let closest_pos = r + t_closest * v_rel;
-                        let closest_approach_dist = closest_pos.length();
-                        if closest_approach_dist <= 150.0 {
-                            missile_threats.push((c.id, dist));
+                if can_missile_intercept(&c.kinematic, &our_kin) {
+                    let v_rel_len_sq = v_rel.dot(v_rel);
+                    if v_rel_len_sq > 0.0 {
+                        let t_closest = -r.dot(v_rel) / v_rel_len_sq;
+                        if t_closest > 0.0 && t_closest <= 5.0 {
+                            let closest_pos = r + t_closest * v_rel;
+                            let closest_approach_dist = closest_pos.length();
+                            if closest_approach_dist <= 150.0 {
+                                missile_threats.push((c.id, dist));
+                            }
                         }
                     }
                 }
@@ -125,8 +254,8 @@ pub struct Ship {
     pd_bullets_fired: u32,
 
     // Magazine reload tracking state
-    bullets_in_magazine: u32,
-    last_reload_ticks: u32,
+    gun0: FireControl,
+    gun1: FireControl,
     force_reload: bool,
 
     target_pos: Rc<RefCell<Option<Vec2>>>,
@@ -169,8 +298,8 @@ impl Ship {
             num_direction_changes: 0,
             pd_target_id: None,
             pd_bullets_fired: 0,
-            bullets_in_magazine: 30,
-            last_reload_ticks: 0,
+            gun0: FireControl::from_gun(0),
+            gun1: FireControl::from_gun(1),
             force_reload: false,
             target_pos,
             ticks_since_reversal: 9999,
@@ -195,16 +324,7 @@ impl Ship {
             debug!("Position: {:?}", position());
 
             // --- Magazine Tracking ---
-            let current_reload = reload_ticks(0);
-            if current_reload > self.last_reload_ticks {
-                self.bullets_in_magazine = self.bullets_in_magazine.saturating_sub(1);
-            }
-            self.last_reload_ticks = current_reload;
-
-            if self.bullets_in_magazine == 0 && current_reload == 0 {
-                self.bullets_in_magazine = 30;
-            }
-            debug!("Magazine bullets: {}", self.bullets_in_magazine);
+            debug!("Magazine bullets: {}", self.gun0.bullets_in_magazine());
 
             // 0. Update priority targets: main enemy and closing missiles
             let mut priority_ids = Vec::new();
@@ -237,16 +357,19 @@ impl Ship {
                     if closing > 0.0 {
                         let t_intercept = dist / closing;
                         if t_intercept <= 5.0 {
-                            incoming_missile_next_5s = true;
-                            break;
+                            if can_missile_intercept(&c.kinematic, &KinematicState::self_state()) {
+                                incoming_missile_next_5s = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
 
-            self.force_reload = self.bullets_in_magazine < 15 && self.bullets_in_magazine > 0 && !incoming_missile_next_5s;
+            let bullets_left = self.gun0.bullets_in_magazine();
+            self.force_reload = bullets_left < 15 && bullets_left > 0 && !incoming_missile_next_5s;
             if self.force_reload {
-                debug!("FORCE RELOAD ACTIVE: Firing remaining {} bullets to reload", self.bullets_in_magazine);
+                debug!("FORCE RELOAD ACTIVE: Firing remaining {} bullets to reload", bullets_left);
             }
 
             if self.fighter_target_id.is_none() {
@@ -456,8 +579,10 @@ impl Ship {
                     if closing_m > 0.0 {
                         let t_intercept = dist_m / closing_m;
                         if t_intercept <= 3.0 && t_intercept >= 0.25 {
-                            if let Some((aim_dir, omega)) = gun_aimer.aim_at(&c.kinematic, &us_kinematic) {
-                                pd_candidates.push((c.clone(), t_intercept, aim_dir, omega));
+                            if can_missile_intercept(&c.kinematic, &us_kinematic) {
+                                if let Some((aim_dir, omega)) = gun_aimer.aim_at(&c.kinematic, &us_kinematic) {
+                                    pd_candidates.push((c.clone(), t_intercept, aim_dir, omega));
+                                }
                             }
                         }
                     }
@@ -541,7 +666,7 @@ impl Ship {
             }
 
             let mut missile_aim_info = None;
-            if reload_ticks(1) <= 10 {
+            if self.gun1.reload_time() <= 10.0 * TICK_LENGTH {
                 let target_kinematic = if let Some(contact) = self.fighter_target_id.and_then(|tid| contacts.iter().find(|c| c.id == tid && c.class == Class::Fighter)) {
                     Some(contact.kinematic.clone())
                 } else if let Some(last_pos) = self.fighter_last_known_target_pos {
@@ -593,27 +718,38 @@ impl Ship {
 
             // Fire main gun (slot 0)
             if self.force_reload {
-                fire(0);
+                self.gun0.fire();
             } else if let Some((pd_angle, _)) = pd_aim_info {
                 let diff = angle_diff(heading(), pd_angle);
-                if reload_ticks(0) == 0 && diff.abs() < 2.0f64.to_radians() {
-                    fire(0);
+                if self.gun0.reload_time() == 0.0 && diff.abs() < 2.0f64.to_radians() {
+                    self.gun0.fire();
                     self.pd_bullets_fired += 1;
                 }
             } else if self.fighter_target_id.is_some() {
                 // Normal gun firing logic against enemy ship
                 if let Some((angle_now, _)) = gun_aim_info {
                     let diff = angle_diff(heading(), angle_now);
-                    if reload_ticks(0) <= 5 && diff.abs() < 0.15f64.to_radians() {
-                        fire(0);
+                    if self.gun0.reload_time() <= 5.0 * TICK_LENGTH && diff.abs() < 0.15f64.to_radians() {
+                        self.gun0.fire();
                     }
                 }
             }
 
             // Determine if we should disable boost while aligning for weapons.
             // When reversing orbit, we only prioritize point defense; we ignore normal gun and missile aiming.
-            let aiming_gun0 = self.bullets_in_magazine > 0 && (pd_aim_info.is_some() || (!is_reversing_orbit && gun_aim_info.is_some()));
-            let turning_for_missile = !is_reversing_orbit && !aiming_gun0 && reload_ticks(1) <= 10 && missile_aim_info.is_some();
+            let gun0_solution = if is_reversing_orbit { pd_aim_info } else { pd_aim_info.or(gun_aim_info) };
+            let aiming_gun0 = if let Some((angle, omega)) = gun0_solution {
+                let turn_time = if max_angular_acceleration() < 1e-6 {
+                    0.0
+                } else {
+                    quick_turn_time_with_target_omega(angle, omega)
+                };
+                let reload_time = self.gun0.reload_time();
+                reload_time <= 0.0 || turn_time > 0.8 * reload_time
+            } else {
+                false
+            };
+            let turning_for_missile = !is_reversing_orbit && !aiming_gun0 && self.gun1.reload_time() <= 10.0 * TICK_LENGTH && missile_aim_info.is_some();
             if aiming_gun0 || turning_for_missile {
                 want_to_boost = false;
             }
@@ -646,7 +782,7 @@ impl Ship {
 
             if let Some((m_pos, m_vel, m_rssi, m_class)) = current_missile_target {
                 let diff_to_desired = angle_diff(heading(), desired_heading);
-                if reload_ticks(1) == 0 && diff_to_desired.abs() <= 15.0f64.to_radians() {
+                if self.gun1.reload_time() == 0.0 && diff_to_desired.abs() <= 15.0f64.to_radians() {
                     if self.salvo_missiles_fired == 0 {
                         // First missile in a salvo
                         let aim_pt = if let Some(aim_pt) = self.salvo_aim_point {
@@ -669,7 +805,7 @@ impl Ship {
                         self.salvo_missiles_fired = (self.salvo_missiles_fired + 1) % SALVO_SIZE;
                     };
 
-                    fire(1);
+                    self.gun1.fire();
                     self.ticks_since_missile_fired = 0;
                     debug!("Fighter {} fired salvo missile, state salvo_missiles_fired={}", id(), self.salvo_missiles_fired);
                 }
@@ -697,7 +833,13 @@ impl Ship {
         if is_reversing_orbit {
             // Point defense is a requirement and remains a priority
             if let Some((angle, omega)) = pd_aim_info {
-                if self.bullets_in_magazine > 0 {
+                let turn_time = if max_angular_acceleration() < 1e-6 {
+                    0.0
+                } else {
+                    quick_turn_time_with_target_omega(angle, omega)
+                };
+                let reload_time = self.gun0.reload_time();
+                if reload_time <= 0.0 || turn_time > 0.8 * reload_time {
                     return (angle, Some(omega));
                 }
             }
@@ -706,17 +848,21 @@ impl Ship {
         }
 
         // 1. If we are aiming the gun0, the aim direction of the main gun and its omega.
-        let aiming_gun0 = self.bullets_in_magazine > 0 && (pd_aim_info.is_some() || gun_aim_info.is_some());
-        if aiming_gun0 {
-            if let Some((angle, omega)) = pd_aim_info {
-                return (angle, Some(omega));
-            } else if let Some((angle, omega)) = gun_aim_info {
+        let gun0_solution = pd_aim_info.or(gun_aim_info);
+        if let Some((angle, omega)) = gun0_solution {
+            let turn_time = if max_angular_acceleration() < 1e-6 {
+                0.0
+            } else {
+                quick_turn_time_with_target_omega(angle, omega)
+            };
+            let reload_time = self.gun0.reload_time();
+            if reload_time <= 0.0 || turn_time > 0.8 * reload_time {
                 return (angle, Some(omega));
             }
         }
 
         // 2. Otherwise, if a missile will be ready to fire in the next 10 ticks, the direction the missile should be fired.
-        if reload_ticks(1) <= 10 {
+        if self.gun1.reload_time() <= 10.0 * TICK_LENGTH {
             if let Some((angle, omega)) = missile_aim_info {
                 return (angle, Some(omega));
             }
@@ -805,8 +951,42 @@ mod fighter_duel_test {
     }
 
     #[test]
+    fn test_can_missile_intercept() {
+        let us = KinematicState::new(Class::Fighter, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0);
+
+        // 1. Missile heading straight at us (should be interceptable)
+        let m_incoming = KinematicState::new(Class::Missile, Vec2::new(400.0, 0.0), Vec2::new(-100.0, 0.0), Vec2::new(0.0, 0.0), 0);
+        assert!(can_missile_intercept(&m_incoming, &us));
+
+        // 2. Missile moving away (should not be interceptable)
+        let m_away = KinematicState::new(Class::Missile, Vec2::new(100.0, 0.0), Vec2::new(50.0, 0.0), Vec2::new(0.0, 0.0), 0);
+        assert!(!can_missile_intercept(&m_away, &us));
+
+        // 3. Missile with very high perp velocity that cannot be cancelled (should not be interceptable)
+        let m_skewed = KinematicState::new(Class::Missile, Vec2::new(100.0, 0.0), Vec2::new(-50.0, 500.0), Vec2::new(0.0, 0.0), 0);
+        assert!(!can_missile_intercept(&m_skewed, &us));
+    }
+
+    thread_local! {
+        static MOCK_RELOAD_0: std::cell::Cell<u32> = std::cell::Cell::new(0);
+        static MOCK_RELOAD_1: std::cell::Cell<u32> = std::cell::Cell::new(0);
+    }
+
+    fn test_reload_ticks(id: usize) -> u32 {
+        match id {
+            0 => MOCK_RELOAD_0.with(|c| c.get()),
+            1 => MOCK_RELOAD_1.with(|c| c.get()),
+            _ => 0,
+        }
+    }
+
+    #[test]
     fn test_compute_desired_heading() {
         let radio_manager = Rc::new(RefCell::new(RadioManager::new()));
+        
+        MOCK_RELOAD_0.with(|c| c.set(0));
+        MOCK_RELOAD_1.with(|c| c.set(0));
+
         let mut ship = Ship {
             radar_controller: RadarController::new(),
             missile_guidance: MissileGuidance::new(),
@@ -821,8 +1001,8 @@ mod fighter_duel_test {
             num_direction_changes: 0,
             pd_target_id: None,
             pd_bullets_fired: 0,
-            bullets_in_magazine: 30,
-            last_reload_ticks: 0,
+            gun0: FireControl::new(0, test_reload_ticks),
+            gun1: FireControl::new(1, test_reload_ticks),
             force_reload: false,
             target_pos: Rc::new(RefCell::new(None)),
             ticks_since_reversal: 9999,
@@ -859,7 +1039,9 @@ mod fighter_duel_test {
         // Case 3: We have no ammo in magazine (bullets_in_magazine = 0).
         // It should NOT aim gun0.
         // If missile is ready (reload_ticks(1) <= 10, which is 0 in tests), it aims missile.
-        ship.bullets_in_magazine = 0;
+        ship.gun0.bullets_in_magazine = 0;
+        MOCK_RELOAD_0.with(|c| c.set(60));
+        MOCK_RELOAD_1.with(|c| c.set(0));
         let (heading, omega) = ship.compute_desired_heading(
             None,
             Some((3.0, 4.0)),
@@ -872,6 +1054,7 @@ mod fighter_duel_test {
 
         // Case 4: No ammo, and no missile aim info.
         // Should fall back to thrust direction (acc_cmd.angle()).
+        MOCK_RELOAD_1.with(|c| c.set(300));
         let (heading, omega) = ship.compute_desired_heading(
             None,
             Some((3.0, 4.0)),
@@ -883,7 +1066,8 @@ mod fighter_duel_test {
         assert_eq!(omega, None);
 
         // Case 5: Reversing orbit, with PD active. Point defense must remain a priority.
-        ship.bullets_in_magazine = 30;
+        ship.gun0.bullets_in_magazine = 30;
+        MOCK_RELOAD_0.with(|c| c.set(0));
         let (heading, omega) = ship.compute_desired_heading(
             Some((1.0, 2.0)),
             Some((3.0, 4.0)),
