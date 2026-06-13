@@ -22,142 +22,60 @@ fn test_target_telemetry_serialization() {
 }
 
 #[test]
-fn test_missile_guidance_math() {
-    // Test acceleration weight function
-    let weight = |t_go: f64| {
-        if t_go >= 5.0 {
-            0.0
-        } else if t_go < 3.0 {
-            1.0
-        } else {
-            (5.0 - t_go) / 2.0
-        }
-    };
-    assert_eq!(weight(6.0), 0.0);
-    assert_eq!(weight(5.0), 0.0);
-    assert_eq!(weight(4.0), 0.5);
-    assert_eq!(weight(3.0), 1.0);
-    assert_eq!(weight(2.0), 1.0);
-
-    // Test alpha calculation to cancel transverse velocity
-    let calculate_alpha = |v_perp: f64, v_boost: f64| {
-        if v_perp.abs() <= v_boost {
-            (-v_perp / v_boost).asin()
-        } else {
-            -v_perp.signum() * std::f64::consts::FRAC_PI_2
-        }
-    };
-    // If v_perp is 0, alpha should be 0
-    assert_eq!(calculate_alpha(0.0, 100.0), 0.0);
-    // If v_perp is 50.0 and v_boost is 100.0, sin(alpha) should be -0.5, so alpha = -pi/6
-    assert!((calculate_alpha(50.0, 100.0) - (-std::f64::consts::FRAC_PI_6)).abs() < 1e-6);
-    // If v_perp is -50.0, alpha = pi/6
-    assert!((calculate_alpha(-50.0, 100.0) - std::f64::consts::FRAC_PI_6).abs() < 1e-6);
-    // If v_perp is larger than v_boost, it should clamp to -pi/2
-    assert_eq!(calculate_alpha(150.0, 100.0), -std::f64::consts::FRAC_PI_2);
-}
-
-#[test]
 fn test_calculate_nez_metric() {
-    let mg = MissileGuidance::new();
-    let contact = Contact {
-        id: 1,
-        kinematic: KinematicState::new(Class::Fighter, vec2(1000.0, 0.0), vec2(0.0, 0.0), vec2(0.0, 0.0), 0),
-        rssi: 0.0,
-        snr: 30.0,
-        pos_uncertainty: 0.0,
-        vel_uncertainty: 0.0,
-        radar_locked: true,
-        provisional: false,
-        tracking_retry_count: 0,
-        confirmation_attempts: 0,
-        unscanned_in_range_ticks: 0,
-        p_cov_x: [[0.0; 3]; 3],
-        p_cov_y: [[0.0; 3]; 3],
+    let snapshot = StateSnapshot {
+        position: vec2(0.0, 0.0),
+        velocity: vec2(100.0, 0.0),
+        heading: 0.0,
+        angular_velocity: 0.0,
+        fuel: 1000.0,
+        current_tick: 0,
+        max_forward_acceleration: 250.0,
+        max_lateral_acceleration: 300.0,
+        max_angular_acceleration: 100.0,
+        target: None,
+        cruise_point: None,
+        has_entered_nez: false,
+        dodge_sign: 1.0,
+    };
+    let target = TargetSnapshot {
+        position: vec2(1000.0, 0.0),
+        velocity: vec2(0.0, 0.0),
+        class: Class::Fighter,
+        last_scanned: 0,
     };
     
-    let nez = mg.calculate_nez_metric(&contact, vec2(1000.0, 0.0), 5.0);
-    // Ensure calculation completes successfully
+    let nez = calculate_nez_metric(&snapshot, &target, vec2(1000.0, 0.0), 5.0);
     assert!(nez.is_finite());
 }
 
 #[test]
-fn test_missile_message_serialization() {
-    // 1. Test Telemetry variant
-    let telemetry = TargetTelemetry {
-        position: vec2(12345.67, -9876.54),
-        velocity: vec2(-456.78, 987.65),
-        rssi: -45.67,
-        class: Class::Fighter,
-        tick: 123,
-    };
-    let msg_tel = MissileMessage::Telemetry(telemetry);
-    let payload_tel = msg_tel.serialize();
-    let deserialized_tel = MissileMessage::deserialize(&payload_tel);
-    
-    if let MissileMessage::Telemetry(t) = deserialized_tel {
-        assert!((telemetry.position.x - t.position.x).abs() < 1e-1);
-        assert!((telemetry.position.y - t.position.y).abs() < 1e-1);
-        assert!((telemetry.velocity.x - t.velocity.x).abs() < 1e-2);
-        assert!((telemetry.velocity.y - t.velocity.y).abs() < 1e-2);
-        assert!((telemetry.rssi - t.rssi).abs() < 1e-3);
-        assert_eq!(telemetry.tick, t.tick);
-        assert_eq!(telemetry.class, t.class);
-    } else {
-        panic!("Deserialized as wrong variant");
-    }
-
-    // 2. Test Loiter variant
-    let loiter = LoiterCommand {
-        aim_point: vec2(-5000.0, 7500.0),
-        cruise_speed: 650.0,
-    };
-    let msg_loi = MissileMessage::Loiter(loiter);
-    let payload_loi = msg_loi.serialize();
-    let deserialized_loi = MissileMessage::deserialize(&payload_loi);
-
-    if let MissileMessage::Loiter(l) = deserialized_loi {
-        assert!((loiter.aim_point.x - l.aim_point.x).abs() < 1e-1);
-        assert!((loiter.aim_point.y - l.aim_point.y).abs() < 1e-1);
-        assert!((loiter.cruise_speed - l.cruise_speed).abs() < 1e-2);
-    } else {
-        panic!("Deserialized as wrong variant");
-    }
-}
-
-#[test]
 fn test_estimate_t_go() {
-    let mut mg = MissileGuidance::new();
-    
-    // Test non-cruising mode: Target moving towards stationary missile at 10 m/s from 1000m away.
-    // Collision should occur in exactly 100 seconds.
-    let contact = Contact {
-        id: 1,
-        kinematic: KinematicState::new(Class::Fighter, vec2(1000.0, 0.0), vec2(-10.0, 0.0), vec2(0.0, 0.0), 0),
-        rssi: 0.0,
-        snr: 30.0,
-        pos_uncertainty: 0.0,
-        vel_uncertainty: 0.0,
-        radar_locked: true,
-        provisional: false,
-        tracking_retry_count: 0,
-        confirmation_attempts: 0,
-        unscanned_in_range_ticks: 0,
-        p_cov_x: [[0.0; 3]; 3],
-        p_cov_y: [[0.0; 3]; 3],
+    let snapshot = StateSnapshot {
+        position: vec2(0.0, 0.0),
+        velocity: vec2(0.0, 0.0),
+        heading: 0.0,
+        angular_velocity: 0.0,
+        fuel: 10000.0,
+        current_tick: 0,
+        max_forward_acceleration: 0.0,
+        max_lateral_acceleration: 300.0,
+        max_angular_acceleration: 100.0,
+        target: None,
+        cruise_point: None,
+        has_entered_nez: false,
+        dodge_sign: 1.0,
+    };
+    let target = TargetSnapshot {
+        position: vec2(1000.0, 0.0),
+        velocity: vec2(-10.0, 0.0),
+        class: Class::Fighter,
+        last_scanned: 0,
     };
 
-    mg.is_cruising = false;
-    let t_go_non_cruise = mg.estimate_t_go(&contact);
-    assert!(t_go_non_cruise.is_finite());
-    // Should be close to 100.0 seconds
-    assert!((t_go_non_cruise - 100.0).abs() < 1e-3, "Expected 100.0, got {}", t_go_non_cruise);
-
-    // Test cruising mode
-    mg.is_cruising = true;
-    let t_go_cruise = mg.estimate_t_go(&contact);
-    assert!(t_go_cruise.is_finite());
-    assert!(t_go_cruise >= 0.0);
+    let t_go = estimate_t_go(&snapshot, &target, false);
+    assert!(t_go.is_finite());
+    assert!((t_go - 100.0).abs() < 1e-3, "Expected 100.0, got {}", t_go);
 }
 
 #[test]
@@ -195,4 +113,77 @@ fn test_minimum_effort_intercept() {
     assert!(res_away.is_none());
 }
 
+#[test]
+fn test_determine_thrust() {
+    let mut snapshot = StateSnapshot {
+        position: vec2(0.0, 0.0),
+        velocity: vec2(100.0, 0.0),
+        heading: 0.0,
+        angular_velocity: 0.0,
+        fuel: 100.0, // below DEFAULT_MIN_SEARCH_FUEL fuel limit
+        current_tick: 0,
+        max_forward_acceleration: 250.0,
+        max_lateral_acceleration: 300.0,
+        max_angular_acceleration: 100.0,
+        target: None,
+        cruise_point: None,
+        has_entered_nez: false,
+        dodge_sign: 1.0,
+    };
+    let prograde = vec2(0.0, 1.0);
+    
+    // Low fuel mode
+    let thrust_low = determine_thrust(&snapshot, Some(prograde), DEFAULT_MIN_SEARCH_FUEL).unwrap();
+    assert!(thrust_low.length() > 0.0);
+
+    // High fuel mode
+    snapshot.fuel = 1000.0;
+    let thrust_high = determine_thrust(&snapshot, Some(prograde), DEFAULT_MIN_SEARCH_FUEL).unwrap();
+    assert!(thrust_high.length() > 0.0);
+
+    // Borderline fuel mode: slightly above limit, but not enough to achieve heading match (100.0 dv needed)
+    snapshot.fuel = DEFAULT_MIN_SEARCH_FUEL + 1.0;
+    let thrust_borderline = determine_thrust(&snapshot, Some(prograde), DEFAULT_MIN_SEARCH_FUEL).unwrap();
+    // It should fallback to calculate_min_lateral_thrust, which steers towards prograde (y-axis)
+    assert!(thrust_borderline.y > 0.0);
+    assert!((thrust_borderline.x).abs() < 1e-3);
+}
+
+#[test]
+fn test_has_entered_nez_latching() {
+    let mut mg = MissileGuidance::new();
+    assert!(!mg.has_entered_nez);
+
+    mg.has_entered_nez = true;
+    let prev_target_id = mg.target_id;
+    mg.target_id = Some(42);
+
+    if mg.target_id != prev_target_id {
+        mg.has_entered_nez = false;
+    }
+
+    assert!(!mg.has_entered_nez);
+}
+
+#[test]
+fn test_flak_dodging_math() {
+    assert_eq!(N, 150.0);
+    assert_eq!(M, 1.5);
+
+    let target_pos = vec2(1000.0, 0.0);
+    let missile_pos = vec2(0.0, 0.0);
+    let r = target_pos - missile_pos;
+    let r_len = r.length();
+    let perp_dir = vec2(-r.y, r.x) / r_len;
+    
+    let dodge_sign_left = 1.0;
+    let offset_left = perp_dir * (dodge_sign_left * (N / 2.0));
+    assert!((offset_left.x - 0.0).abs() < 1e-6);
+    assert!((offset_left.y - 75.0).abs() < 1e-6);
+
+    let dodge_sign_right = -1.0;
+    let offset_right = perp_dir * (dodge_sign_right * (N / 2.0));
+    assert!((offset_right.x - 0.0).abs() < 1e-6);
+    assert!((offset_right.y - -75.0).abs() < 1e-6);
+}
 

@@ -2,7 +2,7 @@ use oort_api::prelude::*;
 use std::rc::Rc;
 use std::cell::RefCell;
 use crate::control::quick_turn_with_target_omega;
-use crate::missile::{MissileGuidance, TargetTelemetry, MissileMessage, LoiterCommand};
+use crate::missile::{MissileGuidance, TargetTelemetry};
 
 const SALVO_SIZE: usize = 2;
 const FIRST_MISSILE_CRUISE_SPEED: f64 = 750.0;
@@ -45,7 +45,7 @@ impl ScanSliceGenerator for BiasedScanSliceGenerator {
     fn next_slice(&mut self, target: Option<&Contact>) -> ScanSlice {
         let target_pos = *self.target_pos.borrow();
         if let Some(pos) = target_pos {
-            let num_slices = 3 * (TAU / self.default_generator.base_search_width).round() as usize;
+            let num_slices = 6 * (TAU / self.default_generator.base_search_width).round() as usize;
             let slice_width = self.biased_scan_width / num_slices as f64;
             
             if self.slice_index >= num_slices {
@@ -143,7 +143,7 @@ impl Ship {
         let target_pos = Rc::new(RefCell::new(None));
         rc.slice_generator = Box::new(BiasedScanSliceGenerator::new(
             DefaultScanSliceGenerator::new(0.6, 20000.0),
-            90.0f64.to_radians(),
+            60.0f64.to_radians(),
             target_pos.clone(),
         ));
 
@@ -154,7 +154,6 @@ impl Ship {
         let mut mg = MissileGuidance::new();
         mg.target_channel = 3;
         mg.secure_radio = Some(missile_radio.clone());
-        mg.cruise_speed = 800.0f64;
 
         Ship {
             radar_controller: rc,
@@ -646,7 +645,8 @@ impl Ship {
             }
 
             if let Some((m_pos, m_vel, m_rssi, m_class)) = current_missile_target {
-                if reload_ticks(1) == 0 {
+                let diff_to_desired = angle_diff(heading(), desired_heading);
+                if reload_ticks(1) == 0 && diff_to_desired.abs() <= 15.0f64.to_radians() {
                     if self.salvo_missiles_fired == 0 {
                         // First missile in a salvo
                         let aim_pt = if let Some(aim_pt) = self.salvo_aim_point {
@@ -672,59 +672,16 @@ impl Ship {
                     fire(1);
                     self.ticks_since_missile_fired = 0;
                     debug!("Fighter {} fired salvo missile, state salvo_missiles_fired={}", id(), self.salvo_missiles_fired);
-
-                    let telemetry = TargetTelemetry {
-                        position: m_pos,
-                        velocity: m_vel,
-                        rssi: m_rssi,
-                        class: m_class,
-                        tick: current_tick() as u8,
-                    };
-                    let msg = MissileMessage::Telemetry(telemetry);
-                    self.missile_radio.transmit(msg.serialize());
-                } else if self.ticks_since_missile_fired == 1 {
-                    if let Some(aim_point) = self.salvo_aim_point {
-                        let cruise_speed = if self.salvo_missiles_fired == 1 {
-                            FIRST_MISSILE_CRUISE_SPEED
-                        } else {
-                            let remaining_ticks = self.salvo_arrival_tick.saturating_sub(current_tick());
-                            let t_remaining = (remaining_ticks as f64) * TICK_LENGTH;
-                            let d_aim = (aim_point - position()).length();
-                            if t_remaining > 1e-6 {
-                                (d_aim / t_remaining).clamp(100.0, 2000.0)
-                            } else {
-                                FIRST_MISSILE_CRUISE_SPEED
-                            }
-                        };
-                        let cmd = LoiterCommand {
-                            aim_point,
-                            cruise_speed,
-                        };
-                        let msg = MissileMessage::Loiter(cmd);
-                        self.missile_radio.transmit(msg.serialize());
-                        debug!("Fighter {} transmitting loiter command to spawned missile on tick after firing: aim={:?}, speed={}", id(), aim_point, cruise_speed);
-                    } else {
-                        let telemetry = TargetTelemetry {
-                            position: m_pos,
-                            velocity: m_vel,
-                            rssi: m_rssi,
-                            class: m_class,
-                            tick: current_tick() as u8,
-                        };
-                        let msg = MissileMessage::Telemetry(telemetry);
-                        self.missile_radio.transmit(msg.serialize());
-                    }
-                } else {
-                    let telemetry = TargetTelemetry {
-                        position: m_pos,
-                        velocity: m_vel,
-                        rssi: m_rssi,
-                        class: m_class,
-                        tick: current_tick() as u8,
-                    };
-                    let msg = MissileMessage::Telemetry(telemetry);
-                    self.missile_radio.transmit(msg.serialize());
                 }
+
+                let telemetry = TargetTelemetry {
+                    position: m_pos,
+                    velocity: m_vel,
+                    rssi: m_rssi,
+                    class: m_class,
+                    tick: current_tick() as u8,
+                };
+                self.missile_radio.transmit(telemetry.serialize());
             }
         }
     }
@@ -790,6 +747,9 @@ mod fighter_duel_test {
             unscanned_in_range_ticks: 0,
             p_cov_x: [[0.0; 3]; 3],
             p_cov_y: [[0.0; 3]; 3],
+            prioritize_scan: false,
+            prev_scan_pos_uncertainty: None,
+            low_improvement_consecutive_scans: 0,
         }
     }
 

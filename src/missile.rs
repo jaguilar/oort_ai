@@ -1,8 +1,16 @@
-use oort_api::prelude::*;
-use crate::radar::{RadarController, Contact, RADIO_PING_SNR};
-use crate::control::{quick_turn, quick_turn_with_target_omega, AngleTracker};
-use crate::physics::KinematicState;
 use crate::aim::AimAt;
+use crate::control::{AngleTracker, quick_turn, quick_turn_with_target_omega};
+use crate::physics::KinematicState;
+use crate::radar::{Contact, RadarController};
+use oort_api::prelude::*;
+
+// Flak-dodging constants:
+// N: extra delta-v (m/s) threshold. Also, offset distance is N/2 meters.
+const N: f64 = 150.0;
+// M: time remaining until intercept (seconds) below which we snap back to the target.
+const M: f64 = 1.5;
+
+pub const DEFAULT_MIN_SEARCH_FUEL: f64 = 500.0;
 
 // Linearly extrapolates target position assuming zero target acceleration.
 // Target acceleration estimates can be volatile and introduce noise/fluctuations
@@ -12,15 +20,6 @@ fn target_position_at(target: &KinematicState, tick: u32) -> Vec2 {
     target.position + target.velocity * dt
 }
 
-// Linearly extrapolates target velocity assuming zero target acceleration.
-fn target_velocity_at(target: &KinematicState, _tick: u32) -> Vec2 {
-    target.velocity
-}
-
-const ALIGNMENT_TIME_THRESHOLD_SEC: f64 = 5.0;
-const ALIGNMENT_ERROR_LARGE_DEG: f64 = 3.0;
-const ALIGNMENT_ERROR_SMALL_DEG: f64 = 0.25;
-
 /// Telemetry data for a tracked target, transmitted securely over radio.
 #[derive(Clone, Copy, Debug)]
 pub struct TargetTelemetry {
@@ -29,89 +28,6 @@ pub struct TargetTelemetry {
     pub rssi: f32,
     pub class: Class,
     pub tick: u8,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct LoiterCommand {
-    pub aim_point: Vec2,
-    pub cruise_speed: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum MissileMessage {
-    Telemetry(TargetTelemetry),
-    Loiter(LoiterCommand),
-}
-
-impl MissileMessage {
-    pub fn serialize(&self) -> [u8; 30] {
-        let mut payload = [0u8; 30];
-        match self {
-            MissileMessage::Telemetry(t) => {
-                payload[0] = 0;
-                payload[1..5].copy_from_slice(&(t.position.x as f32).to_le_bytes());
-                payload[5..9].copy_from_slice(&(t.position.y as f32).to_le_bytes());
-                payload[9..13].copy_from_slice(&(t.velocity.x as f32).to_le_bytes());
-                payload[13..17].copy_from_slice(&(t.velocity.y as f32).to_le_bytes());
-                payload[17..21].copy_from_slice(&t.rssi.to_le_bytes());
-                payload[21] = t.tick;
-                payload[22] = match t.class {
-                    Class::Fighter => 1,
-                    Class::Frigate => 2,
-                    Class::Cruiser => 3,
-                    Class::Missile => 4,
-                    Class::Torpedo => 5,
-                    Class::Target => 6,
-                    _ => 0,
-                };
-            }
-            MissileMessage::Loiter(l) => {
-                payload[0] = 1;
-                payload[1..5].copy_from_slice(&(l.aim_point.x as f32).to_le_bytes());
-                payload[5..9].copy_from_slice(&(l.aim_point.y as f32).to_le_bytes());
-                payload[9..13].copy_from_slice(&(l.cruise_speed as f32).to_le_bytes());
-            }
-        }
-        payload
-    }
-
-    pub fn deserialize(payload: &[u8; 30]) -> Self {
-        match payload[0] {
-            1 => {
-                let aim_x = f32::from_le_bytes(payload[1..5].try_into().unwrap()) as f64;
-                let aim_y = f32::from_le_bytes(payload[5..9].try_into().unwrap()) as f64;
-                let speed = f32::from_le_bytes(payload[9..13].try_into().unwrap()) as f64;
-                MissileMessage::Loiter(LoiterCommand {
-                    aim_point: vec2(aim_x, aim_y),
-                    cruise_speed: speed,
-                })
-            }
-            _ => {
-                let pos_x = f32::from_le_bytes(payload[1..5].try_into().unwrap()) as f64;
-                let pos_y = f32::from_le_bytes(payload[5..9].try_into().unwrap()) as f64;
-                let vel_x = f32::from_le_bytes(payload[9..13].try_into().unwrap()) as f64;
-                let vel_y = f32::from_le_bytes(payload[13..17].try_into().unwrap()) as f64;
-                let rssi = f32::from_le_bytes(payload[17..21].try_into().unwrap());
-                let tick = payload[21];
-                let class = match payload[22] {
-                    1 => Class::Fighter,
-                    2 => Class::Frigate,
-                    3 => Class::Cruiser,
-                    4 => Class::Missile,
-                    5 => Class::Torpedo,
-                    6 => Class::Target,
-                    _ => Class::Fighter,
-                };
-                MissileMessage::Telemetry(TargetTelemetry {
-                    position: vec2(pos_x, pos_y),
-                    velocity: vec2(vel_x, vel_y),
-                    rssi,
-                    class,
-                    tick,
-                })
-            }
-        }
-    }
 }
 
 impl TargetTelemetry {
@@ -191,9 +107,7 @@ impl MissileRadioSender {
                     class: contact.class,
                     tick: current_tick() as u8,
                 };
-                let msg = MissileMessage::Telemetry(telemetry);
-                self.missile_radio.transmit(msg.serialize());
-                debug!("Sent location of {} to missiles", contact.id);
+                self.missile_radio.transmit(telemetry.serialize());
             }
             self.delay_missile_contact = None;
         }
@@ -208,8 +122,6 @@ pub struct MissileGuidance {
     pub proximity_ticks: f64,
     pub pn_gain: f64,
     pub pn_min_vc: f64,
-    pub target_lock_delay_ticks: u32,
-    pub cruise_speed: f64,
     pub min_search_fuel: f64,
     pub turn_safety_buffer_ticks: f64,
 
@@ -218,14 +130,12 @@ pub struct MissileGuidance {
     pub angle_tracker: AngleTracker,
     pub initial_fuel: f64,
     pub target_id: Option<u32>,
-    pub first_detection_tick: Option<u32>,
     pub target_channel: usize,
     pub secure_radio: Option<crate::radio::SecureRadio>,
     pub aim_point: Option<Vec2>,
-    pub is_cruising: bool,
     pub cruise_aim_point: Option<Vec2>,
-    pub cruise_target_speed: Option<f64>,
-    pub received_first_message: bool,
+    pub has_entered_nez: bool,
+    pub dodge_sign: f64,
 }
 
 impl MissileGuidance {
@@ -239,297 +149,63 @@ impl MissileGuidance {
             set_radar_heading(heading());
         }
 
+        let mut radar_controller = RadarController::new();
+        radar_controller.jamming_mode = true;
+
         Self {
             proximity_dist: 20.0,
-            proximity_ticks: 5.0,
+            proximity_ticks: (0.1 / TICK_LENGTH) - 1.0, // Missile bullets last for 200 ms.
             pn_gain: 4.0,
             pn_min_vc: 100.0,
-            target_lock_delay_ticks: 22,
-            cruise_speed: 800.0,
-            min_search_fuel: 500.0,
+            min_search_fuel: DEFAULT_MIN_SEARCH_FUEL,
             turn_safety_buffer_ticks: 1.0,
 
-            radar_controller: RadarController::new(),
+            radar_controller,
             angle_tracker: AngleTracker::new(5.0),
             initial_fuel: fuel(),
             target_id: None,
-            first_detection_tick: None,
             target_channel: 3,
             secure_radio: None,
             aim_point: None,
-            is_cruising: false,
             cruise_aim_point: None,
-            cruise_target_speed: None,
-            received_first_message: false,
-        }
-    }
-
-    fn estimate_t_go(&self, target: &Contact) -> f64 {
-        let us = KinematicState::self_state();
-        let r = target.current_position() - position();
-        let r_len = r.length();
-        if r_len < 1e-6 {
-            return 0.0;
-        }
-        let v_rel = target.current_velocity() - velocity();
-        let v_c = -v_rel.dot(r) / r_len;
-
-        let fuel_economy = self.check_fuel_economy(v_c, r_len, target.class);
-        let fwd_budget = if fuel_economy { 0.0 } else { max_forward_acceleration() };
-
-        let t_go = if let Some(mei) = minimum_effort_intercept(&us, &target.kinematic, fwd_budget) {
-            mei.constant_velocity.t_go
-        } else {
-            let v_cruise = self.cruise_target_speed.unwrap_or(self.cruise_speed);
-            let v_c_clamped = v_c.max(if self.is_cruising { v_cruise } else { velocity().length() }).max(0.1);
-            r_len / v_c_clamped
-        };
-
-        debug!("t_go: {} (extrapolated)", t_go.round() as i32);
-        debug!("  r_len: {}", r_len.round() as i32);
-        debug!("  v_c: {}", v_c.round() as i32);
-        debug!("  self.is_cruising: {}", self.is_cruising);
-
-        t_go
-    }
-
-    fn calculate_aim_point(&self, target: &Contact, t_go: f64) -> Vec2 {
-        let current_t = current_tick();
-        let intercept_tick = current_t + (t_go / TICK_LENGTH).round() as u32;
-        target_position_at(&target.kinematic, intercept_tick)
-    }
-
-    fn calculate_thrust(
-        &self,
-        target: &Contact,
-        aim_point: Vec2,
-        t_go: f64,
-        v_c: f64,
-        los_rate: f64,
-        e_perp: Vec2,
-        fuel_economy: bool,
-        in_nez: bool,
-    ) -> Vec2 {
-        let p = position();
-        let v = velocity();
-        
-        let r_aim = aim_point - p;
-        let r_aim_len = r_aim.length();
-        let dir_aim = if r_aim_len > 1e-6 { r_aim / r_aim_len } else { vec2(heading().cos(), heading().sin()) };
-        let perp_aim = vec2(-dir_aim.y, dir_aim.x);
-        
-        let travel_angle = v.angle();
-        let aim_angle = dir_aim.angle();
-        let angular_error = angle_diff(travel_angle, aim_angle).abs();
-        
-        let allowed_error = if t_go > ALIGNMENT_TIME_THRESHOLD_SEC {
-            ALIGNMENT_ERROR_LARGE_DEG.to_radians()
-        } else {
-            ALIGNMENT_ERROR_SMALL_DEG.to_radians()
-        };
-        
-        let a_max = max_forward_acceleration();
-        let mut a_total = vec2(0.0, 0.0);
-        let mut aligned = true;
-        let mut cruise_speed_reached = false;
-        
-        // 1. Align our travel direction with our aim point
-        if angular_error > allowed_error {
-            aligned = false;
-            let v_perp = v.dot(perp_aim);
-            let a_perp_req = -v_perp / TICK_LENGTH;
-            let a_perp_clamped = a_perp_req.clamp(-a_max, a_max);
-            a_total = a_perp_clamped * perp_aim;
-        }
-        
-        let a_total_len = a_total.length();
-        let spare_acc = (a_max * a_max - a_total_len * a_total_len).max(0.0).sqrt();
-        
-        // 2. Reach our cruise velocity if aligned or spare acceleration is available
-        if aligned || spare_acc > 1e-6 {
-            let v_parallel = v.dot(dir_aim);
-            let fuel_spent = self.initial_fuel - fuel();
-            if v_parallel >= self.cruise_speed && fuel_spent >= self.cruise_speed {
-                cruise_speed_reached = true;
+            has_entered_nez: false,
+            dodge_sign: if cfg!(test) {
+                1.0
+            } else if rand(0.0, 1.0) < 0.5 {
+                -1.0
             } else {
-                let a_parallel_req = if fuel_spent < self.cruise_speed {
-                    spare_acc
-                } else {
-                    (self.cruise_speed - v_parallel) / TICK_LENGTH
-                };
-                let a_parallel_clamped = a_parallel_req.clamp(-spare_acc, spare_acc);
-                a_total += a_parallel_clamped * dir_aim;
-            }
+                1.0
+            },
         }
-        
-        // 3. Fallback to existing calculations if both aligned and cruise speed reached
-        if aligned && cruise_speed_reached && in_nez {
-            if fuel_economy {
-                let a_lateral = self.pn_gain * v_c.max(self.pn_min_vc) * los_rate * e_perp;
-                let r_target = target_position_at(&target.kinematic, current_tick()) - p;
-                let r_target_len = r_target.length();
-                let dir = if r_target_len > 1e-6 {
-                    r_target / r_target_len
-                } else {
-                    vec2(heading().cos(), heading().sin())
-                };
-                let forward_acc = 0.0;
-                a_total = a_lateral + dir * forward_acc;
-            } else {
-                let r_intercept = aim_point - p;
-                let dir_intercept = if r_intercept.length() > 1e-6 {
-                    r_intercept.normalize()
-                } else {
-                    vec2(heading().cos(), heading().sin())
-                };
-
-                let perp_dir = vec2(-dir_intercept.y, dir_intercept.x);
-                let v_perp = v.dot(perp_dir);
-                let alpha = if v_perp.abs() <= 100.0 {
-                    (-v_perp / 100.0).asin()
-                } else {
-                    -v_perp.signum() * std::f64::consts::FRAC_PI_2
-                };
-                let desired_boost_heading = dir_intercept.angle() + alpha;
-                let acc_dir = vec2(desired_boost_heading.cos(), desired_boost_heading.sin());
-                a_total = acc_dir * (max_forward_acceleration() + 100.0);
-            }
-        }
-        
-        a_total
-    }
-
-    fn calculate_nez_metric(&self, target: &Contact, aim_point: Vec2, t_go: f64) -> f64 {
-        let p = position();
-        let v = velocity();
-        
-        let enemy_stats = target.class.default_stats();
-        let a_enemy_base = enemy_stats.max_forward_acceleration
-            .max(enemy_stats.max_backward_acceleration)
-            .max(enemy_stats.max_lateral_acceleration);
-        
-        let num_intervals = (t_go / 10.0).ceil();
-        let enemy_boost_dv = if target.class == Class::Fighter || target.class == Class::Missile {
-            num_intervals * 100.0
-        } else {
-            0.0
-        };
-        
-        let enemy_max_acceleration_sum = a_enemy_base * t_go + enemy_boost_dv;
-        let enemy_displacement = 0.5 * enemy_max_acceleration_sum * t_go;
-        
-        let p_intercept_missile = p + v * t_go;
-        let intercept_tick = current_tick() + (t_go / TICK_LENGTH).round() as u32;
-        let p_intercept_target = target_position_at(&target.kinematic, intercept_tick);
-        let error_vector = p_intercept_target - p_intercept_missile;
-        
-        let r_aim = aim_point - p;
-        let dir_aim = if r_aim.length() > 1e-6 { r_aim.normalize() } else { vec2(heading().cos(), heading().sin()) };
-        let perp_aim = vec2(-dir_aim.y, dir_aim.x);
-        let lateral_error = error_vector.dot(perp_aim).abs();
-        
-        let a_max = max_forward_acceleration();
-        let our_max_acceleration_sum = (a_max * t_go).min(fuel());
-        let our_displacement = 0.5 * our_max_acceleration_sum * t_go;
-        
-        const SPARE_DV_REQUIRED: f64 = 150.0;
-        our_displacement - (enemy_displacement + lateral_error) - SPARE_DV_REQUIRED
-    }
-
-    fn determine_guidance_mode(
-        &self,
-        has_target: bool,
-        is_terminal: bool,
-        fuel_economy: bool,
-    ) -> &'static str {
-        if self.is_cruising {
-            "Cruise Mode"
-        } else if !has_target {
-            if fuel() >= self.min_search_fuel {
-                "Search Mode"
-            } else {
-                "Coast Mode"
-            }
-        } else if is_terminal {
-            "Terminal Turn"
-        } else if fuel_economy {
-            "Fuel Economy"
-        } else {
-            "Standard PN Guidance"
-        }
-    }
-
-    fn check_fuel_economy(&self, v_c: f64, r_len: f64, target_class: Class) -> bool {
-        let possible_enemy_dv = if v_c > 0.0 {
-            let t_intercept = r_len / v_c;
-            let base_dv = t_intercept * target_class.default_stats().max_forward_acceleration;
-            let boost_dv = (t_intercept / 10.0).ceil() * 100.0;
-            base_dv + boost_dv
-        } else {
-            0.0
-        };
-        v_c >= self.cruise_speed && fuel() < possible_enemy_dv
     }
 
     pub fn tick(&mut self) {
         let prev_target_id = self.target_id;
-        if let Some(ref sr) = self.secure_radio {
-            // Secure radio mode
-            if let Some(payload) = sr.receive() {
-                let msg = MissileMessage::deserialize(&payload);
-                debug!("Missile received secure radio message: {:?}", msg);
-                if !self.received_first_message {
-                    self.received_first_message = true;
-                    match msg {
-                        MissileMessage::Loiter(cmd) => {
-                            self.is_cruising = true;
-                            self.cruise_aim_point = Some(cmd.aim_point);
-                            self.cruise_target_speed = Some(cmd.cruise_speed);
-                            debug!("Missile entering cruise mode. Aim point: {:?}, Speed: {}", cmd.aim_point, cmd.cruise_speed);
-                        }
-                        MissileMessage::Telemetry(telemetry) => {
-                            debug!("Decoded secure radio ping: pos=({:.1}, {:.1}) vel=({:.1}, {:.1}) rssi={} class={:?}", telemetry.position.x, telemetry.position.y, telemetry.velocity.x, telemetry.velocity.y, telemetry.rssi, telemetry.class);
-                            let target_id = self.radar_controller.add_radio_ping(telemetry);
-                            if self.target_id.is_none() {
-                                self.target_id = Some(target_id);
-                            }
-                        }
-                    }
-                } else {
-                    match msg {
-                        MissileMessage::Telemetry(telemetry) => {
-                            debug!("Decoded secure radio ping (subsequent): pos=({:.1}, {:.1}) vel=({:.1}, {:.1}) rssi={} class={:?}", telemetry.position.x, telemetry.position.y, telemetry.velocity.x, telemetry.velocity.y, telemetry.rssi, telemetry.class);
-                            self.radar_controller.add_radio_ping(telemetry);
-                            if !self.is_cruising && self.target_id.is_none() {
-                                self.target_id = Some(self.radar_controller.add_radio_ping(telemetry));
-                            }
-                        }
-                        MissileMessage::Loiter(_cmd) => {
-                            // Ignore subsequent loiter commands intended for other missiles
-                        }
-                    }
-                }
-            } 
 
+        // 1. Parse radio message
+        if let Some(ref sr) = self.secure_radio {
+            if let Some(payload) = sr.receive() {
+                let telemetry = TargetTelemetry::deserialize(&payload);
+                self.radar_controller.add_radio_ping(telemetry);
+            }
             sr.prepare_receive();
         } else {
-            // Standard radio mode
-            // 1. Listen on the target radio channel
             select_radio(0);
             set_radio_channel(self.target_channel);
-
-            // Try standard float message first ([f64; 4]: pos_x, pos_y, vel_x, vel_y)
             if let Some(msg) = receive() {
                 let pos_x = msg[0];
                 let pos_y = msg[1];
                 let vel_x = msg[2];
                 let vel_y = msg[3];
 
-                // Mismatched byte representation when interpreted as f64 yields astronomical values or NaNs.
-                // Check that the numbers are finite and lie within reasonable limits to distinguish formats.
-                if pos_x.is_finite() && pos_y.is_finite() && vel_x.is_finite() && vel_y.is_finite()
-                    && pos_x.abs() < 100_000.0 && pos_y.abs() < 100_000.0
-                    && vel_x.abs() < 10_000.0 && vel_y.abs() < 10_000.0
+                if pos_x.is_finite()
+                    && pos_y.is_finite()
+                    && vel_x.is_finite()
+                    && vel_y.is_finite()
+                    && pos_x.abs() < 100_000.0
+                    && pos_y.abs() < 100_000.0
+                    && vel_x.abs() < 10_000.0
+                    && vel_y.abs() < 10_000.0
                 {
                     let telemetry = TargetTelemetry {
                         position: vec2(pos_x, pos_y),
@@ -538,391 +214,1023 @@ impl MissileGuidance {
                         class: Class::Fighter,
                         tick: current_tick() as u8,
                     };
-                    debug!("Decoded radio float ping on channel {}: pos=({:.1}, {:.1})", self.target_channel, telemetry.position.x, telemetry.position.y);
-                    self.received_first_message = true;
                     self.radar_controller.add_radio_ping(telemetry);
                 }
             }
         }
 
-        // Set current target as high priority in the radar controller
-        self.radar_controller.priority_targets = self.target_id.map(|id| vec![id]).unwrap_or_default();
+        // 2. Update radar
+        self.radar_controller.priority_targets =
+            self.target_id.map(|id| vec![id]).unwrap_or_default();
         self.radar_controller.update();
         let contacts = self.radar_controller.contacts();
-        let current_t = current_tick();
 
-        // If we are cruising, check if any contact has entered our NEZ or if t_go is below 10s
-        if self.is_cruising {
-            let mut found_target = None;
-            for c in contacts.iter() {
-                if c.class != Class::Missile && c.class != Class::Torpedo {
-                    let (t_go, aim_point) = MissileAimer::calculate_intercept(&c.kinematic, position(), velocity(), 0.0, current_tick());
-                    let nez_metric = self.calculate_nez_metric(c, aim_point, t_go);
-                    if nez_metric >= 0.0 || t_go < 10.0 {
-                        found_target = Some(c.id);
-                        debug!("Encountered enemy ID {} (nez_metric: {}, t_go: {:.2}s). Locking on and exiting cruise mode.", c.id, nez_metric, t_go);
-                        break;
-                    }
-                }
-            }
-            if let Some(target_id) = found_target {
-                self.is_cruising = false;
-                self.target_id = Some(target_id);
-            }
-        }
+        // Target selection
+        let target_still_valid = if let Some(id) = self.target_id {
+            contacts
+                .iter()
+                .any(|c| c.id == id && c.class != Class::Missile)
+        } else {
+            false
+        };
 
-        if !self.is_cruising {
-            // 3. Target selection
-            // A target is valid if it is still tracked in the contact list and is a Fighter
-            let target_still_valid = if let Some(id) = self.target_id {
-                contacts.iter().any(|c| c.id == id && c.class != Class::Missile)
-            } else {
-                false
-            };
-
-            // Filter contacts to only target Class::Fighter
-            let fighters: Vec<&Contact> = contacts.iter()
-                .filter(|c| c.class != Class::Missile)
-                .collect();
-
-            // Set the first detection tick if we've just detected a fighter
-            if !fighters.is_empty() && self.first_detection_tick.is_none() {
-                self.first_detection_tick = Some(current_t);
-            }
-
-            if !target_still_valid {
-                // Delay target selection until we've had time for two full scans after first target detection,
-                // unless we have a confirmed target from radio telemetry (indicated by snr == RADIO_PING_SNR).
-                let has_confirmed_radio_fighter = fighters.iter().any(|f| f.snr == RADIO_PING_SNR);
-                let can_lock = if has_confirmed_radio_fighter {
-                    true
-                } else if let Some(first_tick) = self.first_detection_tick {
-                    current_t - first_tick >= self.target_lock_delay_ticks
-                } else {
-                    false
-                };
-
-                if can_lock && !fighters.is_empty() {
-                    // Pick a random fighter instead of the closest one
-                    let idx = (rand(0.0, fighters.len() as f64).floor() as usize).min(fighters.len() - 1);
-                    let new_id = fighters[idx].id;
-                    if let Some(old_id) = self.target_id {
-                        debug!("Ceasing targeting of target {} because it is no longer valid (not in contacts list or not a fighter); locking onto new target {}", old_id, new_id);
-                    }
-                    self.target_id = Some(new_id);
-                } else {
-                    if let Some(old_id) = self.target_id {
-                        debug!("Ceasing targeting of target {} because it is no longer valid (not in contacts list or not a fighter) and no new target lock could be acquired", old_id);
-                    }
-                    self.target_id = None;
-                }
-            }
+        if !target_still_valid {
+            self.target_id = contacts
+                .iter()
+                .find(|c| c.class != Class::Missile)
+                .map(|c| c.id);
         }
 
         if self.target_id != prev_target_id {
             self.aim_point = None;
+            self.has_entered_nez = false;
         }
 
+        // Construct snapshots
+        let mut target_snapshot = None;
         if let Some(tid) = self.target_id {
-            if let Some(target) = contacts.iter().find(|c| c.id == tid) {
-                let target_pos = target_position_at(&target.kinematic, current_tick());
-                let target_vel = target_velocity_at(&target.kinematic, current_tick());
-                let target_class = target.class;
+            if let Some(contact) = contacts.iter().find(|c| c.id == tid) {
+                target_snapshot = Some(TargetSnapshot {
+                    position: contact.current_position(),
+                    velocity: contact.current_velocity(),
+                    class: contact.class,
+                    last_scanned: contact.kinematic.last_scanned,
+                });
+            }
+        }
 
-                let r = target_pos - position();
-                let r_len = r.length();
-                let v_rel = target_vel - velocity();
-
-                // 1. Self-destruct proximity check: detonate if within target proximity or will be soon
-                let next_r = r + v_rel * (self.proximity_ticks * TICK_LENGTH);
-                if r_len < self.proximity_dist || next_r.length() < self.proximity_dist {
-                    explode();
-                    return;
-                }
-
-                // 2. Proportional Navigation Guidance
-                // Line-of-sight angular rate (cross product / r^2)
-                let numerator = r.x * v_rel.y - r.y * v_rel.x;
-                let denominator = r.dot(r);
-                let los_rate = if denominator > 1e-6 { numerator / denominator } else { 0.0 };
-
-                // Closing velocity
-                let v_c = -v_rel.dot(r) / r_len;
-
-                // Calculate the anticipated intercept point using the weighted acceleration logic
-                let time_to_intercept = self.estimate_t_go(target);
-                let aim_point = self.calculate_aim_point(target, time_to_intercept);
-                self.aim_point = Some(aim_point);
-                debug!("Time to intercept: {:}s", time_to_intercept);
-
-                let nez_metric = self.calculate_nez_metric(target, aim_point, time_to_intercept);
-                debug!("NEZ Metric: {}", nez_metric.round() as i32);
-                debug!("Target in NEZ: {}", nez_metric >= 0.0);
-
-                // Lateral acceleration command perpendicular to LOS in the direction of rotation
-                let e_perp = vec2(-r.y, r.x) / r_len;
-                let a_lateral = self.pn_gain * v_c.max(self.pn_min_vc) * los_rate * e_perp;
-
-                // Forward acceleration with fuel economy check
-                let dir = if r_len > 1e-6 {
-                    r / r_len
-                } else {
-                    vec2(heading().cos(), heading().sin())
-                };
-
-                // Check if we need to engage fuel economy mode (e.g. if fuel is low relative to possible enemy maneuvers)
-                let fuel_economy = self.check_fuel_economy(v_c, r_len, target_class);
-
-                let forward_acc = if fuel_economy {
-                    0.0
-                } else {
-                    max_forward_acceleration()
-                };
-
-                let in_nez = nez_metric >= 0.0;
-                let a_total = self.calculate_thrust(
-                    target,
-                    aim_point,
-                    time_to_intercept,
-                    v_c,
-                    los_rate,
-                    e_perp,
-                    fuel_economy,
-                    in_nez,
-                );
-
-                // Turn to point directly at target intercept point when it's time to explode
-                let time_until_explosion = (time_to_intercept - self.proximity_ticks * TICK_LENGTH).max(0.0);
-
-                // Heading we need to face at the moment of explosion
-                let position_at_explosion = position() + time_until_explosion * velocity();
-                let target_pos_at_explosion = target_position_at(&target.kinematic, current_tick() + (time_until_explosion / TICK_LENGTH).round() as u32);
-                let explode_heading = (target_pos_at_explosion - position_at_explosion).angle();
-
-                // Calculate how long we need to turn from the current heading to explode_heading
-                let diff = angle_diff(heading(), explode_heading);
-                let omega = angular_velocity();
-                let a = max_angular_acceleration().max(1.0);
-
-                let time_to_stop = if omega * diff < 0.0 { omega.abs() / a } else { 0.0 };
-                let angle_to_stop = 0.5 * omega.powi(2) / a;
-                let remaining_angle = (diff.abs() + if omega * diff < 0.0 { angle_to_stop } else { -angle_to_stop }).max(0.0);
-                let time_remaining_turn = 2.0 * (remaining_angle / a).sqrt();
-                let turn_time = time_to_stop + time_remaining_turn;
-
-                // Add a small safety buffer to ensure we finish the turn in time
-                let safety_buffer = self.turn_safety_buffer_ticks * TICK_LENGTH;
-                let turn_time_with_buffer = turn_time + safety_buffer;
-
-                if time_until_explosion <= turn_time_with_buffer || time_until_explosion < 0.5 {
-                    let r = target_pos_at_explosion - position();
-                    let target_angle = r.angle();
-                    let r_len_sq = r.dot(r);
-                    let target_omega = if r_len_sq > 1e-6 {
-                        (-r.x * velocity().y + r.y * velocity().x) / r_len_sq
-                    } else {
-                        0.0
-                    };
-                    let torque_val = crate::control::quick_turn_torque_with_target_omega(target_angle, target_omega);
-                    debug!("Terminal Turn:");
-                    debug!("  Target Angle: {} deg", target_angle.to_degrees().round() as i32);
-                    debug!("  Current Heading: {} deg", heading().to_degrees().round() as i32);
-                    debug!("  Target Omega: {} deg/s", target_omega.to_degrees().round() as i32);
-                    debug!("  Current Omega: {} deg/s", angular_velocity().to_degrees().round() as i32);
-                    debug!("  Torque: {} deg/s^2", torque_val.to_degrees().round() as i32);
-                    quick_turn_with_target_omega(target_angle, target_omega);
-                } else {
-                    quick_turn(a_total.angle());
-                }
-
-                accelerate(a_total);
-
-                // Print guidance mode and acceleration components
-                let is_terminal = time_until_explosion <= turn_time_with_buffer;
-                let mode = self.determine_guidance_mode(true, is_terminal, fuel_economy);
-                debug!("Mode: {}", mode);
-
-                // Boost should only be used while the target-direction acceleration vector component is greater than 100 m/s^2
-                // and the missile is aimed toward the direction it is trying to accelerate in.
-                // If that is not the case, actively deactivate boost.
-                let target_accel_component = if !fuel_economy {
-                    a_total.length()
-                } else {
-                    a_total.dot(dir)
-                };
-                let aimed_correctly = if a_total.length() > 0.0 {
-                    angle_diff(heading(), a_total.angle()).abs() < 5.0f64.to_radians()
-                } else {
-                    false
-                };
-
-                if !fuel_economy && target_accel_component > 100.0 && aimed_correctly {
-                    activate_ability(Ability::Boost);
-                } else {
-                    deactivate_ability(Ability::Boost);
-                }
-
-                // Draw projected intercept point of the currently selected target
-                if v_c > 0.0 {
-                    draw_diamond(aim_point, 16.0, rgb(255, 0, 0));
-                    draw_line(position(), aim_point, rgb(255, 0, 0));
-                    draw_line(target_pos, aim_point, rgb(0, 255, 0)); // Draw vector from target to intercept in green
-                    draw_text!(aim_point + vec2(0.0, 20.0), rgb(255, 0, 0), "Intercept: {:.2}s", time_to_intercept);
-                }
-
-                // Draw the current position of the currently selected target
-                draw_square(target_pos, 20.0, rgb(255, 0, 0));
+        let snapshot = StateSnapshot {
+            position: position(),
+            velocity: velocity(),
+            heading: heading(),
+            angular_velocity: angular_velocity(),
+            fuel: fuel(),
+            current_tick: current_tick(),
+            max_forward_acceleration: if cfg!(test) {
+                250.0
             } else {
-                self.aim_point = None;
+                max_forward_acceleration()
+            },
+            max_lateral_acceleration: if cfg!(test) {
+                300.0
+            } else {
+                max_lateral_acceleration()
+            },
+            max_angular_acceleration: if cfg!(test) {
+                100.0
+            } else {
+                max_angular_acceleration()
+            },
+            target: target_snapshot,
+            cruise_point: self.cruise_aim_point,
+            has_entered_nez: self.has_entered_nez,
+            dodge_sign: self.dodge_sign,
+        };
+
+        // Detonation condition
+        if check_detonation_condition(&snapshot, self.proximity_ticks) {
+            explode();
+            return;
+        }
+
+        // 3. Determine desired prograde
+        let prog_res = determine_prograde(&snapshot, self.pn_gain, self.pn_min_vc);
+
+        // Update state
+        self.cruise_aim_point = prog_res.cruise_point;
+        self.aim_point = prog_res.aim_point_use;
+        if prog_res.nez_metric_passed {
+            self.has_entered_nez = true;
+        }
+
+        // 4. Determine thrust
+        let thrust = determine_thrust(&snapshot, prog_res.prograde, self.min_search_fuel);
+
+        // 5. Determine desired attitude
+        let att_res = determine_attitude(
+            &snapshot,
+            thrust,
+            prog_res.prograde,
+            self.proximity_ticks,
+            self.turn_safety_buffer_ticks,
+        );
+
+        // Apply control commands
+        if let Some(t) = thrust {
+            accelerate(t);
+        } else {
+            accelerate(vec2(0.0, 0.0));
+        }
+        if let Some(target_omega) = att_res.target_omega {
+            quick_turn_with_target_omega(att_res.desired_heading, target_omega);
+        } else {
+            quick_turn(att_res.desired_heading);
+        }
+
+        let boost_active = if let Some(t) = thrust {
+            should_boost(&snapshot, t, self.min_search_fuel)
+        } else {
+            false
+        };
+        if boost_active {
+            activate_ability(Ability::Boost);
+        } else {
+            deactivate_ability(Ability::Boost);
+        }
+
+        let p = position();
+        if let Some(t) = thrust {
+            draw_line(p, p + t, rgb(0, 255, 255)); // CYAN for total thrust
+        }
+
+        // Draw current prograde and desired prograde as 1km rays
+        if snapshot.velocity.length() > 1e-6 {
+            let current_prog_vec = snapshot.velocity.normalize();
+            draw_line(p, p + current_prog_vec * 1000.0, rgb(255, 0, 255)); // Magenta
+        }
+
+        if let Some(desired_prog_vec) = prog_res.prograde {
+            let end_point = p + desired_prog_vec * 1000.0;
+            draw_line(p, end_point, rgb(0, 255, 0)); // Green
+            draw_diamond(end_point, 12.0, rgb(0, 255, 0));
+        }
+
+        let desired_heading_dir =
+            vec2(att_res.desired_heading.cos(), att_res.desired_heading.sin());
+        draw_line(p, p + desired_heading_dir * 150.0, rgb(255, 255, 0)); // Yellow
+
+        // Cruising point is only drawn if the missile is relying on it
+        if snapshot.target.is_none() || !prog_res.can_defeat {
+            if let Some(cp) = prog_res.cruise_point {
+                draw_diamond(cp, 15.0, rgb(0, 128, 255)); // Azure
+                draw_line(p, cp, rgb(0, 128, 255));
+                draw_text!(cp + vec2(0.0, 20.0), rgb(0, 128, 255), "Cruise Point");
+            }
+        }
+
+        // Boost active indicator
+        let boost_active_debug = if let Some(t) = thrust {
+            should_boost(&snapshot, t, self.min_search_fuel)
+        } else {
+            false
+        };
+        if boost_active_debug {
+            draw_text!(p + vec2(0.0, -60.0), rgb(255, 64, 64), "BOOST ACTIVE");
+        }
+
+        // Fuel economy indicator
+        if snapshot.fuel < self.min_search_fuel {
+            draw_text!(
+                p + vec2(0.0, -80.0),
+                rgb(255, 128, 0),
+                "Fuel Economy: {:.1} < {:.1}",
+                snapshot.fuel,
+                self.min_search_fuel
+            );
+        }
+
+        if let Some(target) = snapshot.target {
+            let target_pos = target.position_at(snapshot.current_tick);
+            let target_vel = target.velocity_at(snapshot.current_tick);
+            let v_rel = target_vel - snapshot.velocity;
+
+            // Target relative velocity in ORANGE
+            draw_line(target_pos, target_pos + v_rel * 2.0, rgb(255, 128, 0));
+
+            // Target positions
+            if let Some(target_use) = prog_res.target_to_use {
+                let target_pos_use = target_use.position_at(snapshot.current_tick);
+                draw_square(target_pos_use, 20.0, rgb(255, 0, 0)); // Effective target pos in red
+                draw_square(target_pos, 10.0, rgb(0, 255, 255)); // Real target pos in cyan
+                if prog_res.dodge_active {
+                    draw_line(target_pos, target_pos_use, rgb(255, 255, 0)); // Yellow dodge offset line
+                }
+            }
+
+            // Intercept point visualization
+            let r = target_pos - p;
+            let v_c = -v_rel.dot(r) / r.length().max(1e-6);
+            if v_c > 0.0 {
+                if let Some(aim_use) = prog_res.aim_point_use {
+                    draw_diamond(aim_use, 16.0, rgb(255, 0, 0));
+                    draw_line(p, aim_use, rgb(255, 0, 0));
+                    if let Some(target_use) = prog_res.target_to_use {
+                        draw_line(
+                            target_use.position_at(snapshot.current_tick),
+                            aim_use,
+                            rgb(0, 255, 0),
+                        );
+                    }
+                }
+                if let Some(aim) = prog_res.aim_point {
+                    draw_diamond(aim, 10.0, rgb(0, 255, 255));
+                    draw_line(p, aim, rgb(0, 255, 255));
+                }
+                if prog_res.dodge_active {
+                    if let (Some(aim), Some(aim_use)) = (prog_res.aim_point, prog_res.aim_point_use)
+                    {
+                        draw_line(aim, aim_use, rgb(255, 255, 0));
+                    }
+                }
+                if let Some(aim_use) = prog_res.aim_point_use {
+                    draw_text!(
+                        aim_use + vec2(0.0, 20.0),
+                        rgb(255, 0, 0),
+                        "Intercept: {:.2}s",
+                        prog_res.t_go_use
+                    );
+                }
+            }
+
+            if let Some(impact_pos) = att_res.target_pos_at_impact {
+                draw_diamond(impact_pos, 16.0, rgb(255, 0, 0));
+            }
+
+            // Proximity fuse detonation check visualization
+            let t_bullet = self.proximity_ticks * TICK_LENGTH;
+            let p_enemy_fuse =
+                target.position_at(snapshot.current_tick + self.proximity_ticks.round() as u32);
+            let bullet_pos_at_fuse = p + snapshot.velocity * t_bullet;
+            draw_polygon(
+                bullet_pos_at_fuse,
+                1000.0 * t_bullet,
+                16,
+                0.0,
+                rgb(255, 0, 128),
+            ); // Pink circle
+            draw_square(p_enemy_fuse, 8.0, rgb(255, 0, 128));
+            draw_line(bullet_pos_at_fuse, p_enemy_fuse, rgb(255, 0, 128));
+
+            // Terminal turn values and status comparison text
+            if let (Some(t_exp), Some(t_turn)) =
+                (att_res.time_until_explosion, att_res.turn_time_with_buffer)
+            {
+                draw_text!(
+                    p + vec2(0.0, -40.0),
+                    if att_res.is_terminal {
+                        rgb(255, 0, 0)
+                    } else {
+                        rgb(200, 200, 200)
+                    },
+                    "t_exp: {:.2}s / t_turn: {:.2}s",
+                    t_exp,
+                    t_turn
+                );
+            }
+
+            // Terminal turn details (aim vector, explosion point, target pos at explosion)
+            if att_res.is_terminal {
+                if let (Some(p_exp), Some(p_t_exp)) = (att_res.p_explode, att_res.p_target_explode)
+                {
+                    draw_diamond(p_exp, 15.0, rgb(255, 0, 0));
+                    draw_text!(p_exp + vec2(0.0, -20.0), rgb(255, 0, 0), "Detonation Point");
+                    draw_line(p, p_exp, rgb(255, 0, 0));
+
+                    draw_square(p_t_exp, 15.0, rgb(0, 255, 255));
+                    draw_text!(
+                        p_t_exp + vec2(0.0, 20.0),
+                        rgb(0, 255, 255),
+                        "Target at Detonation"
+                    );
+
+                    draw_line(p_exp, p_t_exp, rgb(255, 255, 0));
+                }
+            }
+
+            // Proportional Navigation acceleration visualizer
+            if let Some(a_pn) = prog_res.a_pn {
+                draw_line(p, p + a_pn, rgb(128, 0, 255)); // Purple for PN acceleration
+                draw_text!(
+                    p + a_pn + vec2(0.0, 10.0),
+                    rgb(128, 0, 255),
+                    "a_pn: {:.1}",
+                    a_pn.length()
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TargetSnapshot {
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub class: Class,
+    pub last_scanned: u32,
+}
+
+impl TargetSnapshot {
+    pub fn position_at(&self, tick: u32) -> Vec2 {
+        let dt = (tick as i64 - self.last_scanned as i64) as f64 * TICK_LENGTH;
+        self.position + self.velocity * dt
+    }
+
+    pub fn velocity_at(&self, _tick: u32) -> Vec2 {
+        self.velocity
+    }
+
+    pub fn to_kinematic_state(&self) -> KinematicState {
+        KinematicState::new(
+            self.class,
+            self.position,
+            self.velocity,
+            vec2(0.0, 0.0),
+            self.last_scanned,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StateSnapshot {
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub heading: f64,
+    pub angular_velocity: f64,
+    pub fuel: f64,
+    pub current_tick: u32,
+    pub max_forward_acceleration: f64,
+    pub max_lateral_acceleration: f64,
+    pub max_angular_acceleration: f64,
+    pub target: Option<TargetSnapshot>,
+    pub cruise_point: Option<Vec2>,
+    pub has_entered_nez: bool,
+    pub dodge_sign: f64,
+}
+
+impl StateSnapshot {
+    pub fn to_kinematic_state(&self) -> KinematicState {
+        KinematicState::new(
+            Class::Missile,
+            self.position,
+            self.velocity,
+            vec2(0.0, 0.0),
+            self.current_tick,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProgradeResult {
+    pub prograde: Option<Vec2>,
+    pub cruise_point: Option<Vec2>,
+    pub can_defeat: bool,
+    pub nez_metric_passed: bool,
+    pub dodge_active: bool,
+    pub target_to_use: Option<TargetSnapshot>,
+    pub aim_point: Option<Vec2>,
+    pub aim_point_use: Option<Vec2>,
+    pub t_go: f64,
+    pub t_go_use: f64,
+    pub v_c_use: f64,
+    pub a_pn: Option<Vec2>,
+}
+
+pub fn check_detonation_condition(snapshot: &StateSnapshot, proximity_ticks: f64) -> bool {
+    if let Some(target) = snapshot.target {
+        let t_bullet = proximity_ticks * TICK_LENGTH;
+        let p_enemy_fuse =
+            target.position_at(snapshot.current_tick + proximity_ticks.round() as u32);
+        let vec_bullet_rel = p_enemy_fuse - snapshot.position - snapshot.velocity * t_bullet;
+        vec_bullet_rel.length() <= 1000.0 * t_bullet
+    } else {
+        false
+    }
+}
+
+pub fn estimate_t_go(snapshot: &StateSnapshot, target: &TargetSnapshot, is_cruising: bool) -> f64 {
+    let r = target.position_at(snapshot.current_tick) - snapshot.position;
+    let r_len = r.length();
+    if r_len < 1e-6 {
+        return 0.0;
+    }
+    let dir = r / r_len;
+    let us_kin = snapshot.to_kinematic_state();
+    let v_max = crate::control::max_achievable_velocity(&us_kin, dir, snapshot.fuel)
+        .unwrap_or(snapshot.velocity);
+    let target_vel = target.velocity_at(snapshot.current_tick);
+    let v_c_after = -(target_vel - v_max).dot(dir);
+
+    let v_rel = target_vel - snapshot.velocity;
+    let v_c = -v_rel.dot(dir);
+
+    let possible_enemy_dv = if v_c > 0.0 {
+        let t_intercept = r_len / v_c;
+        let base_dv = t_intercept * target.class.default_stats().max_forward_acceleration;
+        let boost_dv = (t_intercept / 10.0).ceil() * 100.0;
+        base_dv + boost_dv
+    } else {
+        0.0
+    };
+    let fuel_economy = v_c >= v_c_after && snapshot.fuel < possible_enemy_dv;
+
+    let fwd_budget = if fuel_economy {
+        0.0
+    } else {
+        snapshot.max_forward_acceleration
+    };
+
+    let target_kin = target.to_kinematic_state();
+
+    let t_go = if let Some(mei) = minimum_effort_intercept(&us_kin, &target_kin, fwd_budget) {
+        mei.constant_velocity.t_go
+    } else {
+        let v_c_clamped = v_c
+            .max(if is_cruising {
+                v_c_after
+            } else {
+                snapshot.velocity.length()
+            })
+            .max(0.1);
+        r_len / v_c_clamped
+    };
+
+    t_go
+}
+
+pub fn calculate_nez_metric(
+    snapshot: &StateSnapshot,
+    target: &TargetSnapshot,
+    aim_point: Vec2,
+    t_go: f64,
+) -> f64 {
+    let enemy_stats = target.class.default_stats();
+    let a_enemy_base = enemy_stats
+        .max_forward_acceleration
+        .max(enemy_stats.max_backward_acceleration)
+        .max(enemy_stats.max_lateral_acceleration);
+
+    let num_intervals = (t_go / 10.0).ceil();
+    let enemy_boost_dv = if target.class == Class::Fighter || target.class == Class::Missile {
+        num_intervals * 100.0
+    } else {
+        0.0
+    };
+
+    let enemy_max_acceleration_sum = a_enemy_base * t_go + enemy_boost_dv;
+    let enemy_displacement = 0.5 * enemy_max_acceleration_sum * t_go;
+
+    let p_intercept_missile = snapshot.position + snapshot.velocity * t_go;
+    let p_intercept_target =
+        target.position_at(snapshot.current_tick + (t_go / TICK_LENGTH).round() as u32);
+    let error_vector = p_intercept_target - p_intercept_missile;
+
+    let r_aim = aim_point - snapshot.position;
+    let dir_aim = if r_aim.length() > 1e-6 {
+        r_aim.normalize()
+    } else {
+        vec2(snapshot.heading.cos(), snapshot.heading.sin())
+    };
+    let perp_aim = vec2(-dir_aim.y, dir_aim.x);
+    let lateral_error = error_vector.dot(perp_aim).abs();
+
+    let our_max_acceleration_sum = (snapshot.max_forward_acceleration * t_go).min(snapshot.fuel);
+    let our_displacement = 0.5 * our_max_acceleration_sum * t_go;
+
+    const SPARE_DV_REQUIRED: f64 = 150.0;
+    our_displacement - (enemy_displacement + lateral_error) - SPARE_DV_REQUIRED
+}
+
+pub fn determine_prograde(
+    snapshot: &StateSnapshot,
+    pn_gain: f64,
+    pn_min_vc: f64,
+) -> ProgradeResult {
+    // 1. Resolve/Establish cruise point if we have a target or already have a cruise point
+    let cruise_point = if let Some(cp) = snapshot.cruise_point {
+        Some(cp)
+    } else if let Some(target) = snapshot.target {
+        let target_pos = target.position_at(snapshot.current_tick);
+        let target_vel = target.velocity_at(snapshot.current_tick);
+        let vel_len = target_vel.length();
+        let dir_course = if vel_len > 1e-6 {
+            target_vel / vel_len
+        } else {
+            vec2(1.0, 0.0)
+        };
+        let offset_dist = rand(-2000.0, 2000.0);
+        Some(target_pos + dir_course * offset_dist)
+    } else {
+        None
+    };
+
+    if snapshot.target.is_none() {
+        if let Some(cp) = cruise_point {
+            let diff = cp - snapshot.position;
+            let prograde = if diff.length() > 1e-6 {
+                diff.normalize()
+            } else {
+                vec2(snapshot.heading.cos(), snapshot.heading.sin())
+            };
+            return ProgradeResult {
+                prograde: Some(prograde),
+                cruise_point: Some(cp),
+                can_defeat: false,
+                nez_metric_passed: false,
+                dodge_active: false,
+                target_to_use: None,
+                aim_point: None,
+                aim_point_use: None,
+                t_go: 0.0,
+                t_go_use: 0.0,
+                v_c_use: 0.0,
+                a_pn: None,
+            };
+        } else {
+            // No cruise point and no target
+            return ProgradeResult {
+                prograde: None,
+                cruise_point: None,
+                can_defeat: false,
+                nez_metric_passed: false,
+                dodge_active: false,
+                target_to_use: None,
+                aim_point: None,
+                aim_point_use: None,
+                t_go: 0.0,
+                t_go_use: 0.0,
+                v_c_use: 0.0,
+                a_pn: None,
+            };
+        }
+    }
+
+    let target = snapshot.target.unwrap();
+    let target_kinematic = target.to_kinematic_state();
+
+    // 2. Decide if we can defeat the target
+    let t_go = estimate_t_go(snapshot, &target, true);
+    let aim_point = target.position_at(snapshot.current_tick + (t_go / TICK_LENGTH).round() as u32);
+
+    let nez_metric = calculate_nez_metric(snapshot, &target, aim_point, t_go);
+    let nez_metric_passed = nez_metric >= 0.0;
+    let can_defeat = nez_metric_passed || t_go < 10.0;
+
+    if !can_defeat {
+        // If we cannot defeat, prograde is toward the established cruise point.
+        let cp = cruise_point.unwrap();
+        let diff = cp - snapshot.position;
+        let prograde = if diff.length() > 1e-6 {
+            diff.normalize()
+        } else {
+            vec2(snapshot.heading.cos(), snapshot.heading.sin())
+        };
+        return ProgradeResult {
+            prograde: Some(prograde),
+            cruise_point: Some(cp),
+            can_defeat: false,
+            nez_metric_passed: false,
+            dodge_active: false,
+            target_to_use: Some(target),
+            aim_point: Some(aim_point),
+            aim_point_use: Some(aim_point),
+            t_go,
+            t_go_use: t_go,
+            v_c_use: 0.0,
+            a_pn: None,
+        };
+    }
+
+    // 3. Dodging logic
+    let mut extra_dv = 0.0;
+    let us_kin = snapshot.to_kinematic_state();
+    let r = target.position_at(snapshot.current_tick) - snapshot.position;
+    let r_len = r.length();
+    let dir_target = if r_len > 1e-6 {
+        r / r_len
+    } else {
+        vec2(1.0, 0.0)
+    };
+    let v_max = crate::control::max_achievable_velocity(&us_kin, dir_target, snapshot.fuel)
+        .unwrap_or(snapshot.velocity);
+    let target_vel = target.velocity_at(snapshot.current_tick);
+    let v_c_after = -(target_vel - v_max).dot(dir_target);
+
+    let fuel_economy_orig = {
+        let v_rel = target_vel - snapshot.velocity;
+        let v_c = -v_rel.dot(dir_target);
+        let possible_enemy_dv = if v_c > 0.0 {
+            let t_intercept = r_len / v_c;
+            let base_dv = t_intercept * target.class.default_stats().max_forward_acceleration;
+            let boost_dv = (t_intercept / 10.0).ceil() * 100.0;
+            base_dv + boost_dv
+        } else {
+            0.0
+        };
+        v_c >= v_c_after && snapshot.fuel < possible_enemy_dv
+    };
+
+    let fwd_budget = if fuel_economy_orig {
+        0.0
+    } else {
+        snapshot.max_forward_acceleration
+    };
+    if let Some(mei) = minimum_effort_intercept(&us_kin, &target_kinematic, fwd_budget) {
+        let worst_case_fuel = mei
+            .worst_case_positive
+            .fuel_consumed
+            .max(mei.worst_case_negative.fuel_consumed);
+        extra_dv = snapshot.fuel - worst_case_fuel;
+    }
+
+    let dodge_active = snapshot.has_entered_nez && extra_dv >= N && t_go > M;
+    let mut target_to_use = target;
+    if dodge_active {
+        let r = target.position - snapshot.position;
+        let r_len = r.length();
+        let perp_dir = if r_len > 1e-6 {
+            vec2(-r.y, r.x) / r_len
+        } else {
+            vec2(-snapshot.heading.sin(), snapshot.heading.cos())
+        };
+        let offset = perp_dir * (snapshot.dodge_sign * (N / 2.0));
+        target_to_use.position += offset;
+    }
+
+    // Recalculate tracking using target_to_use
+    let target_pos_use = target_to_use.position_at(snapshot.current_tick);
+    let target_vel_use = target_to_use.velocity_at(snapshot.current_tick);
+    let r_use = target_pos_use - snapshot.position;
+    let r_len_use = r_use.length();
+    let v_rel_use = target_vel_use - snapshot.velocity;
+
+    let numerator_use = r_use.x * v_rel_use.y - r_use.y * v_rel_use.x;
+    let denominator_use = r_use.dot(r_use);
+    let los_rate_use = if denominator_use > 1e-6 {
+        numerator_use / denominator_use
+    } else {
+        0.0
+    };
+
+    let v_c_use = -v_rel_use.dot(r_use) / r_len_use.max(1e-6);
+    let t_go_use = estimate_t_go(snapshot, &target_to_use, false);
+    let aim_point_use =
+        target_to_use.position_at(snapshot.current_tick + (t_go_use / TICK_LENGTH).round() as u32);
+
+    let e_perp_use = vec2(-r_use.y, r_use.x) / r_len_use.max(1e-6);
+    let a_pn = pn_gain * v_c_use.max(pn_min_vc) * los_rate_use * e_perp_use;
+
+    let prograde = (snapshot.velocity + a_pn).normalize();
+    ProgradeResult {
+        prograde: Some(prograde),
+        cruise_point,
+        can_defeat: true,
+        nez_metric_passed,
+        dodge_active,
+        target_to_use: Some(target_to_use),
+        aim_point: Some(aim_point),
+        aim_point_use: Some(aim_point_use),
+        t_go,
+        t_go_use,
+        v_c_use,
+        a_pn: Some(a_pn),
+    }
+}
+
+pub fn calculate_min_lateral_thrust(v: Vec2, p: Vec2, max_lat: f64) -> Vec2 {
+    let v_len = v.length();
+    if v_len < 1e-6 {
+        return vec2(0.0, 0.0);
+    }
+    let dot = p.dot(v);
+    if dot > 1e-6 {
+        let a_lat = (p * (v_len * v_len / dot) - v) / TICK_LENGTH;
+        if a_lat.length() > max_lat {
+            a_lat.normalize() * max_lat
+        } else {
+            a_lat
+        }
+    } else {
+        let v_hat = v / v_len;
+        let p_perp = p - p.dot(v_hat) * v_hat;
+        if p_perp.length() > 1e-6 {
+            p_perp.normalize() * max_lat
+        } else {
+            vec2(-v.y, v.x).normalize() * max_lat
+        }
+    }
+}
+
+pub fn determine_thrust(
+    snapshot: &StateSnapshot,
+    prograde: Option<Vec2>,
+    fuel_limit: f64,
+) -> Option<Vec2> {
+    let prograde = prograde?;
+
+    let available_dv = (snapshot.fuel - fuel_limit).max(0.0);
+    let us_kin = snapshot.to_kinematic_state();
+
+    if let Some(v_desired) =
+        crate::control::max_achievable_velocity(&us_kin, prograde, available_dv)
+    {
+        let thrust_dir =
+            crate::control::match_velocity_thrust_heading(snapshot.velocity, v_desired);
+        if let Some(dv_dir) = thrust_dir {
+            let heading_vec = vec2(snapshot.heading.cos(), snapshot.heading.sin());
+            let dp_parallel = dv_dir.dot(heading_vec);
+            let dp_perp = (dv_dir - dp_parallel * heading_vec).length();
+
+            let a_max_p = snapshot.max_forward_acceleration * dp_parallel.abs()
+                + snapshot.max_lateral_acceleration * dp_perp;
+
+            let thrust_mag = 0.95 * a_max_p;
+            let max_vel_change = thrust_mag * TICK_LENGTH;
+            let dv = v_desired - snapshot.velocity;
+
+            let thrust = if dv.length() < max_vel_change {
+                dv / TICK_LENGTH
+            } else {
+                dv_dir * thrust_mag
+            };
+            Some(thrust)
+        } else {
+            Some(vec2(0.0, 0.0))
+        }
+    } else {
+        Some(calculate_min_lateral_thrust(
+            snapshot.velocity,
+            prograde,
+            snapshot.max_lateral_acceleration,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AttitudeResult {
+    pub desired_heading: f64,
+    pub target_omega: Option<f64>,
+    pub is_terminal: bool,
+    pub target_pos_at_impact: Option<Vec2>,
+    pub time_until_explosion: Option<f64>,
+    pub turn_time_with_buffer: Option<f64>,
+    pub explode_heading: Option<f64>,
+    pub p_explode: Option<Vec2>,
+    pub p_target_explode: Option<Vec2>,
+}
+
+pub fn determine_attitude(
+    snapshot: &StateSnapshot,
+    thrust: Option<Vec2>,
+    prograde: Option<Vec2>,
+    proximity_ticks: f64,
+    turn_safety_buffer_ticks: f64,
+) -> AttitudeResult {
+    if let Some(target) = snapshot.target {
+        let target_pos = target.position_at(snapshot.current_tick);
+        let target_vel = target.velocity_at(snapshot.current_tick);
+        let r = target_pos - snapshot.position;
+        let v_rel = target_vel - snapshot.velocity;
+
+        let t_bullet = proximity_ticks * TICK_LENGTH;
+        let bullet_range = 1000.0 * t_bullet;
+        let a_coef = v_rel.dot(v_rel);
+        let b_coef = 2.0 * r.dot(v_rel);
+        let c_coef = r.dot(r) - bullet_range.powi(2);
+        let discriminant = b_coef * b_coef - 4.0 * a_coef * c_coef;
+
+        let target_kin = target.to_kinematic_state();
+        let us_kin = snapshot.to_kinematic_state();
+        let t_go_fallback = if let Some(mei) =
+            minimum_effort_intercept(&us_kin, &target_kin, snapshot.max_forward_acceleration)
+        {
+            mei.constant_velocity.t_go
+        } else {
+            let v_c = -v_rel.dot(r) / r.length().max(1e-6);
+            r.length() / v_c.max(0.1)
+        };
+
+        let t_total = if discriminant >= 0.0 && a_coef > 1e-6 {
+            let sol1 = (-b_coef - discriminant.sqrt()) / (2.0 * a_coef);
+            let sol2 = (-b_coef + discriminant.sqrt()) / (2.0 * a_coef);
+            if sol1 >= t_bullet {
+                sol1
+            } else if sol2 >= t_bullet {
+                sol2
+            } else {
+                t_bullet
             }
         } else {
-            self.aim_point = None;
-            if self.is_cruising {
-                let cruise_speed = self.cruise_target_speed.unwrap_or(self.cruise_speed);
-                let aim_point = self.cruise_aim_point.unwrap_or(position());
+            t_go_fallback.max(t_bullet)
+        };
 
-                let r_aim = aim_point - position();
-                let r_aim_len = r_aim.length();
-                let dir_aim = if r_aim_len > 1e-6 { r_aim / r_aim_len } else { vec2(heading().cos(), heading().sin()) };
-                let perp_aim = vec2(-dir_aim.y, dir_aim.x);
-                let v = velocity();
-                let travel_angle = v.angle();
-                let aim_angle = dir_aim.angle();
-                let angular_error = angle_diff(travel_angle, aim_angle).abs();
+        let time_until_explosion = (t_total - t_bullet).max(0.0);
 
-                let allowed_error = ALIGNMENT_ERROR_LARGE_DEG.to_radians();
-                let a_max = max_forward_acceleration();
-                let mut a_total = vec2(0.0, 0.0);
-                let mut aligned = true;
+        let t_exp = time_until_explosion;
+        let p_explode = snapshot.position + t_exp * snapshot.velocity;
+        let p_target_explode =
+            target.position_at(snapshot.current_tick + (t_exp / TICK_LENGTH).round() as u32);
+        let v_target_explode =
+            target.velocity_at(snapshot.current_tick + (t_exp / TICK_LENGTH).round() as u32);
+        let r_explode = p_target_explode - p_explode;
+        let v_rel_explode = v_target_explode - snapshot.velocity;
 
-                if angular_error > allowed_error {
-                    aligned = false;
-                    let v_perp = v.dot(perp_aim);
-                    let a_perp_req = -v_perp / TICK_LENGTH;
-                    let a_perp_clamped = a_perp_req.clamp(-a_max, a_max);
-                    a_total = a_perp_clamped * perp_aim;
-                }
+        let vec_aim = r_explode + v_rel_explode * t_bullet;
+        let explode_heading = vec_aim.angle();
 
-                let a_total_len = a_total.length();
-                let spare_acc = (a_max * a_max - a_total_len * a_total_len).max(0.0).sqrt();
+        let diff = angle_diff(snapshot.heading, explode_heading);
+        let omega = snapshot.angular_velocity;
+        let a = snapshot.max_angular_acceleration.max(1.0);
 
-                if aligned || spare_acc > 1e-6 {
-                    let v_parallel = v.dot(dir_aim);
-                    let a_parallel_req = (cruise_speed - v_parallel) / TICK_LENGTH;
-                    let a_parallel_clamped = a_parallel_req.clamp(-spare_acc, spare_acc);
-                    a_total += a_parallel_clamped * dir_aim;
-                }
-
-                quick_turn(a_total.angle());
-                accelerate(a_total);
-                deactivate_ability(Ability::Boost);
-
-                let mode = self.determine_guidance_mode(false, false, false);
-                debug!("Mode: {}", mode);
+        let time_to_stop = if omega * diff < 0.0 {
+            omega.abs() / a
+        } else {
+            0.0
+        };
+        let angle_to_stop = 0.5 * omega.powi(2) / a;
+        let remaining_angle = (diff.abs()
+            + if omega * diff < 0.0 {
+                angle_to_stop
             } else {
-                // No target - burn straight ahead at maximum speed until we find a lock, provided we retain fuel
-                let mode = self.determine_guidance_mode(false, false, false);
-                let a_cmd = if mode == "Search Mode" {
-                    let heading_dir = vec2(heading().cos(), heading().sin());
-                    heading_dir * max_forward_acceleration()
-                } else {
-                    vec2(0.0, 0.0)
-                };
-                debug!("Mode: {}", mode);
+                -angle_to_stop
+            })
+        .max(0.0);
+        let time_remaining_turn = 2.0 * (remaining_angle / a).sqrt();
+        let turn_time = time_to_stop + time_remaining_turn;
 
-                accelerate(a_cmd);
-                deactivate_ability(Ability::Boost);
+        let safety_buffer = turn_safety_buffer_ticks * TICK_LENGTH;
+        let turn_time_with_buffer = turn_time + safety_buffer;
+
+        let is_terminal =
+            time_until_explosion <= turn_time_with_buffer || time_until_explosion < 0.5;
+        let desired_heading = if is_terminal {
+            explode_heading
+        } else if let Some(t) = thrust {
+            if t.length() > 1e-6 {
+                t.angle()
+            } else if let Some(p) = prograde {
+                p.angle()
+            } else {
+                snapshot.heading
             }
-        }
-        debug!("Missile current aim_point: {:?}", self.aim_point.or_else(|| self.cruise_aim_point));
+        } else if let Some(p) = prograde {
+            p.angle()
+        } else {
+            snapshot.heading
+        };
+        let target_omega = if is_terminal { Some(0.0) } else { None };
+
+        return AttitudeResult {
+            desired_heading,
+            target_omega,
+            is_terminal,
+            target_pos_at_impact: Some(
+                target.position_at(snapshot.current_tick + (t_total / TICK_LENGTH).round() as u32),
+            ),
+            time_until_explosion: Some(time_until_explosion),
+            turn_time_with_buffer: Some(turn_time_with_buffer),
+            explode_heading: Some(explode_heading),
+            p_explode: Some(p_explode),
+            p_target_explode: Some(p_target_explode),
+        };
     }
+
+    let desired_heading = if let Some(t) = thrust {
+        if t.length() > 1e-6 {
+            t.angle()
+        } else if let Some(p) = prograde {
+            p.angle()
+        } else {
+            snapshot.heading
+        }
+    } else if let Some(p) = prograde {
+        p.angle()
+    } else {
+        snapshot.heading
+    };
+
+    AttitudeResult {
+        desired_heading,
+        target_omega: None,
+        is_terminal: false,
+        target_pos_at_impact: None,
+        time_until_explosion: None,
+        turn_time_with_buffer: None,
+        explode_heading: None,
+        p_explode: None,
+        p_target_explode: None,
+    }
+}
+
+pub fn should_boost(snapshot: &StateSnapshot, thrust: Vec2, fuel_limit: f64) -> bool {
+    let fuel_economy = snapshot.fuel < fuel_limit;
+    if fuel_economy {
+        return false;
+    }
+    let aimed_correctly = if thrust.length() > 0.0 {
+        angle_diff(snapshot.heading, thrust.angle()).abs() < 5.0f64.to_radians()
+    } else {
+        false
+    };
+    thrust.length() > 100.0 && aimed_correctly
 }
 
 pub struct MissileAimer {
-    pub cruise_speed: f64,
+    pub available_dv: f64,
+    pub launch_speed: f64,
 }
 
 impl MissileAimer {
-    pub fn new(cruise_speed: f64) -> Self {
-        Self { cruise_speed }
+    pub fn new(available_dv: f64, launch_speed: f64) -> Self {
+        Self {
+            available_dv,
+            launch_speed,
+        }
     }
 
-    pub fn calculate_intercept(
+    pub fn calculate_fire_direction(
+        &self,
         target: &KinematicState,
-        missile_pos: Vec2,
-        missile_vel: Vec2,
-        cruise_speed: f64,
+        us: &KinematicState,
         current_tick: u32,
-    ) -> (f64, Vec2) {
-        let missile = KinematicState::new(
+    ) -> Option<(Vec2, f64)> {
+        let target_pos = target_position_at(target, current_tick);
+        let r = target_pos - us.position;
+        let r_len = r.length();
+        let dir_est = if r_len > 1e-6 {
+            r / r_len
+        } else {
+            Vec2::new(
+                us.heading.unwrap_or(0.0).cos(),
+                us.heading.unwrap_or(0.0).sin(),
+            )
+        };
+
+        // 1. Initial velocity estimation assuming launch in dir_est
+        let v_launch_est = us.velocity + dir_est * self.launch_speed;
+        let missile_kin = KinematicState::new(
             Class::Missile,
-            missile_pos,
-            missile_vel,
+            us.position,
+            v_launch_est,
             Vec2::new(0.0, 0.0),
             current_tick,
         );
+        let v_max_est =
+            crate::control::max_achievable_velocity(&missile_kin, dir_est, self.available_dv)
+                .unwrap_or(v_launch_est);
+        let v_speed = v_max_est.length().max(0.1);
 
-        let target_pos = target_position_at(target, current_tick);
-        let r = target_pos - missile_pos;
-        let r_len = r.length();
-        if r_len < 1e-6 {
-            return (0.0, target_pos);
-        }
-        let target_vel = target_velocity_at(target, current_tick);
-        let v_rel = target_vel - missile_vel;
-        let v_c = -v_rel.dot(r) / r_len;
+        // 2. Predict lead intercept time and direction using absolute missile speed
+        let (t_go, dir_aim) = crate::control::predict_lead(
+            us.position,
+            Vec2::new(0.0, 0.0),
+            v_speed,
+            target.position_at(current_tick),
+            target.velocity_at(current_tick),
+            target.acceleration,
+        )?;
 
-        if let Some(mei) = minimum_effort_intercept(&missile, target, 0.0) {
-            (mei.constant_velocity.t_go, mei.constant_velocity.position)
+        // 3. Compute actual optimal launch velocity and burn required
+        let v_launch_opt = us.velocity + dir_aim * self.launch_speed;
+        let missile_kin_opt = KinematicState::new(
+            Class::Missile,
+            us.position,
+            v_launch_opt,
+            Vec2::new(0.0, 0.0),
+            current_tick,
+        );
+        let v_final =
+            crate::control::max_achievable_velocity(&missile_kin_opt, dir_aim, self.available_dv)
+                .unwrap_or(v_launch_opt);
+        let v_diff = v_final - us.velocity;
+
+        if v_diff.length() > 1e-6 {
+            Some((v_diff.normalize(), t_go))
         } else {
-            let v_c_clamped = v_c.max(cruise_speed).max(0.1);
-            let t_go = r_len / v_c_clamped;
-            let intercept_tick = current_tick + (t_go / TICK_LENGTH).round() as u32;
-            let intercept_point = target_position_at(target, intercept_tick);
-            (t_go, intercept_point)
+            Some((dir_aim, t_go))
         }
     }
 }
 
 impl AimAt for MissileAimer {
-    fn aim_at(
-        &self,
-        target: &KinematicState,
-        us: &KinematicState,
-    ) -> Option<(Vec2, f64)> {
-        let target_pos = target_position_at(target, current_tick());
-        let r = target_pos - us.position;
-        let r_len = r.length();
-        let dir = if r_len > 1e-6 { r / r_len } else { Vec2::new(us.heading.unwrap_or(0.0).cos(), us.heading.unwrap_or(0.0).sin()) };
-        let estimated_missile_vel = us.velocity + dir * self.cruise_speed;
+    fn aim_at(&self, target: &KinematicState, us: &KinematicState) -> Option<(Vec2, f64)> {
+        // Compute firing direction for current tick
+        let (fire_dir, _) = self.calculate_fire_direction(target, us, current_tick())?;
 
-        let (_, intercept_point) = Self::calculate_intercept(target, us.position, estimated_missile_vel, self.cruise_speed, current_tick());
-        let d = intercept_point - us.position;
-        let d_len = d.length();
-        if d_len > 1e-6 {
-            let aim_dir = d.normalize();
+        // Extrapolate state to next tick to compute omega
+        let target_next = KinematicState::new(
+            target.class,
+            target.position_at(current_tick() + 1),
+            target.velocity_at(current_tick() + 1),
+            target.acceleration,
+            current_tick() + 1,
+        );
 
-            // Extrapolate the aim point next tick
-            let target_pos_next = target_position_at(target, current_tick() + 1);
-            let us_pos_next = us.position + us.velocity * TICK_LENGTH;
-            let r_next = target_pos_next - us_pos_next;
-            let r_len_next = r_next.length();
-            let dir_next = if r_len_next > 1e-6 { r_next / r_len_next } else { dir };
-            let estimated_missile_vel_next = us.velocity + dir_next * self.cruise_speed;
+        let us_next = KinematicState::new(
+            us.class,
+            us.position + us.velocity * TICK_LENGTH,
+            us.velocity + us.acceleration * TICK_LENGTH,
+            us.acceleration,
+            current_tick() + 1,
+        );
 
-            let (_, intercept_point_next) = Self::calculate_intercept(target, us_pos_next, estimated_missile_vel_next, self.cruise_speed, current_tick() + 1);
-            let d_next = intercept_point_next - us_pos_next;
-            
-            let omega = if d_next.length() > 0.0 {
-                angle_diff(aim_dir.angle(), d_next.angle()) / TICK_LENGTH
-            } else {
-                0.0
-            };
-
-            Some((aim_dir, omega))
-        } else {
-            None
+        let mut omega = 0.0;
+        if let Some((fire_dir_next, _)) =
+            self.calculate_fire_direction(&target_next, &us_next, current_tick() + 1)
+        {
+            omega = angle_diff(fire_dir.angle(), fire_dir_next.angle()) / TICK_LENGTH;
         }
+
+        Some((fire_dir, omega))
     }
 }
 
@@ -969,8 +1277,16 @@ pub fn minimum_effort_intercept(
         return None;
     }
 
-    let max_fwd_acc = if cfg!(test) { 250.0 } else { max_forward_acceleration() };
-    let max_lat_acc = if cfg!(test) { 300.0 } else { max_forward_acceleration() };
+    let max_fwd_acc = if cfg!(test) {
+        250.0
+    } else {
+        max_forward_acceleration()
+    };
+    let max_lat_acc = if cfg!(test) {
+        300.0
+    } else {
+        max_forward_acceleration()
+    };
     let available_fuel = if cfg!(test) { 10000.0 } else { fuel() };
     let a_fwd = forward_accel_budget.min(max_fwd_acc);
 
@@ -1003,12 +1319,21 @@ pub fn minimum_effort_intercept(
     let red_len = (p_enemy_max - p_enemy_min).length();
     let tick_len = red_len / 5.0;
 
-    let p_reach_min = enemy.position + enemy.velocity * t_go + 0.5 * a_e_reach_min * t_go * t_go * w0;
-    let p_reach_max = enemy.position + enemy.velocity * t_go + 0.5 * a_e_reach_max * t_go * t_go * w0;
+    let p_reach_min =
+        enemy.position + enemy.velocity * t_go + 0.5 * a_e_reach_min * t_go * t_go * w0;
+    let p_reach_max =
+        enemy.position + enemy.velocity * t_go + 0.5 * a_e_reach_max * t_go * t_go * w0;
 
-    draw_line(p_reach_min - u0 * (tick_len / 2.0), p_reach_min + u0 * (tick_len / 2.0), rgb(0, 255, 0));
-    draw_line(p_reach_max - u0 * (tick_len / 2.0), p_reach_max + u0 * (tick_len / 2.0), rgb(0, 255, 0));
-
+    draw_line(
+        p_reach_min - u0 * (tick_len / 2.0),
+        p_reach_min + u0 * (tick_len / 2.0),
+        rgb(0, 255, 0),
+    );
+    draw_line(
+        p_reach_max - u0 * (tick_len / 2.0),
+        p_reach_max + u0 * (tick_len / 2.0),
+        rgb(0, 255, 0),
+    );
 
     let evaluate_intercept = |a_e_val: f64| -> InterceptResult {
         let target_pos = enemy.position + enemy.velocity * t_go + 0.5 * a_e_val * t_go * t_go * w0;

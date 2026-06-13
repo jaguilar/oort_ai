@@ -475,3 +475,43 @@ fn test_quick_turn_torque_kinematic_perpendicular_traversing() {
     );
 }
 
+#[test]
+fn test_max_achievable_velocity() {
+    use crate::physics::KinematicState;
+    let state = KinematicState::new(
+        Class::Missile,
+        vec2(0.0, 0.0),
+        vec2(100.0, 50.0),
+        vec2(0.0, 0.0),
+        0,
+    );
+    let heading = vec2(1.0, 0.0); // directly x-axis
+
+    // Case 1: available_dv is smaller than perpendicular velocity (50.0)
+    let v_res1 = super::max_achievable_velocity(&state, heading, 30.0);
+    assert!(v_res1.is_none());
+
+    // Case 2: available_dv is larger than perpendicular velocity (50.0)
+    let v_res2 = super::max_achievable_velocity(&state, heading, 130.0).unwrap();
+    // 50.0 is used to zero out perp component, leaving 120.0 to gain speed along heading
+    // discriminant = sqrt(130^2 - 50^2) = 120
+    // v_desired_mag = 100.0 + 120.0 = 220.0
+    assert!((v_res2.y - 0.0).abs() < 1e-3);
+    assert!((v_res2.x - 220.0).abs() < 1e-3);
+}
+
+#[test]
+fn test_match_velocity_thrust_heading() {
+    let current_vel = vec2(100.0, 0.0);
+    let target_vel = vec2(150.0, 50.0);
+
+    let thrust_dir = super::match_velocity_thrust_heading(current_vel, target_vel);
+    assert!(thrust_dir.is_some());
+    let dir = thrust_dir.unwrap();
+    assert!((dir.length() - 1.0).abs() < 1e-6);
+    assert!(dir.x > 0.0 && dir.y > 0.0);
+
+    let no_thrust = super::match_velocity_thrust_heading(current_vel, current_vel);
+    assert!(no_thrust.is_none());
+}
+

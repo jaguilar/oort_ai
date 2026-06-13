@@ -37,12 +37,12 @@ impl KinematicState {
     }
 
     pub fn position_at(&self, tick: u32) -> Vec2 {
-        let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
+        let dt = tick.wrapping_sub(self.last_scanned) as f64 * TICK_LENGTH;
         self.position + self.velocity * dt + 0.5 * self.acceleration * dt * (dt + TICK_LENGTH)
     }
 
     pub fn velocity_at(&self, tick: u32) -> Vec2 {
-        let dt = (tick - self.last_scanned) as f64 * TICK_LENGTH;
+        let dt = tick.wrapping_sub(self.last_scanned) as f64 * TICK_LENGTH;
         self.velocity + self.acceleration * dt
     }
 }

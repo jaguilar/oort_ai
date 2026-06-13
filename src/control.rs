@@ -24,7 +24,7 @@ pub fn quick_turn_torque_with_target_omega_impl(
     let target_angle_next = target_angle;
     let diff_next = angle_diff(unaccelerated_next_heading, target_angle_next);
     let omega_rel = omega - target_omega;
-    
+
     // 1-step deadbeat control when error is already zero (or extremely small)
     if difference.abs() <= 1e-9 && omega_rel.abs() <= max_ang_accel * TICK_LENGTH {
         return (-omega_rel / TICK_LENGTH).clamp(-max_ang_accel, max_ang_accel);
@@ -37,20 +37,20 @@ pub fn quick_turn_torque_with_target_omega_impl(
         let alpha_req = diff_next / (TICK_LENGTH * TICK_LENGTH);
         return alpha_req.clamp(-max_ang_accel, max_ang_accel);
     }
-    
+
     // No safety buffer: use 100% of max angular acceleration
     let a_dec = max_ang_accel;
     let k_p = 60.0;
-    
+
     let theta_trans = a_dec / (k_p * k_p);
     let theta_offset = theta_trans / 2.0;
-    
+
     let omega_target_static = if difference.abs() <= theta_trans {
         k_p * difference
     } else {
         difference.signum() * (2.0 * a_dec * (difference.abs() - theta_offset)).sqrt()
     };
-    
+
     let is_decelerating = difference * (omega - target_omega) > 0.0
         && (omega - target_omega).abs() > omega_target_static.abs()
         && difference.abs() > theta_trans;
@@ -58,15 +58,22 @@ pub fn quick_turn_torque_with_target_omega_impl(
     let alpha_req = if is_decelerating {
         let s = difference.signum();
         let diff_adjusted = difference.abs() - theta_offset;
-        ( (target_omega - omega) - a_dec * s * TICK_LENGTH - s * (a_dec * (2.0 * diff_adjusted + a_dec * TICK_LENGTH * TICK_LENGTH)).sqrt() ) / TICK_LENGTH
+        ((target_omega - omega)
+            - a_dec * s * TICK_LENGTH
+            - s * (a_dec * (2.0 * diff_adjusted + a_dec * TICK_LENGTH * TICK_LENGTH)).sqrt())
+            / TICK_LENGTH
     } else {
         let omega_target = omega_target_static + target_omega;
         (omega_target - omega) / TICK_LENGTH
     };
-    
+
     let torque = alpha_req.clamp(-max_ang_accel, max_ang_accel);
     if difference.abs() > 0.002 {
-        if torque >= 0.0 { max_ang_accel } else { -max_ang_accel }
+        if torque >= 0.0 {
+            max_ang_accel
+        } else {
+            -max_ang_accel
+        }
     } else {
         torque
     }
@@ -97,7 +104,10 @@ pub fn quick_turn_torque_kinematic_impl(
         0.0
     };
 
-    let difference = angle_diff(heading, target_heading_next - target_omega_next * TICK_LENGTH);
+    let difference = angle_diff(
+        heading,
+        target_heading_next - target_omega_next * TICK_LENGTH,
+    );
     let unaccelerated_next_heading = heading + omega * TICK_LENGTH;
     let diff_next = angle_diff(unaccelerated_next_heading, target_heading_next);
     let omega_rel = omega - target_omega_next;
@@ -147,12 +157,16 @@ pub fn quick_turn_torque_kinematic_impl(
     let cross = |a: Vec2, b: Vec2| a.x * b.y - a.y * b.x;
 
     let f = |t_align: f64| {
-        let p_rel = target_pos - our_pos 
-            + (target_vel - our_vel) * t_align 
+        let p_rel = target_pos - our_pos
+            + (target_vel - our_vel) * t_align
             + 0.5 * (target_accel - our_accel) * t_align * (t_align + TICK_LENGTH);
         let target_heading = p_rel.angle();
-        let target_heading_unwrapped = target_heading - 2.0 * std::f64::consts::PI * ((target_heading - target_heading_0_unwrapped) / (2.0 * std::f64::consts::PI)).round();
-        
+        let target_heading_unwrapped = target_heading
+            - 2.0
+                * std::f64::consts::PI
+                * ((target_heading - target_heading_0_unwrapped) / (2.0 * std::f64::consts::PI))
+                    .round();
+
         let r_len_sq = p_rel.dot(p_rel);
         let target_omega = if r_len_sq > 1e-6 {
             let v_rel = target_vel - our_vel + (target_accel - our_accel) * t_align;
@@ -160,19 +174,23 @@ pub fn quick_turn_torque_kinematic_impl(
         } else {
             0.0
         };
-        
+
         let t = 0.5 * (t_align + (target_omega - omega) / (s * max_ang_accel));
-        let theta_our = heading + omega * t_align + s * max_ang_accel * (2.0 * t * t_align - t * t - 0.5 * t_align * t_align + (t - 0.5 * t_align) * TICK_LENGTH);
-        
+        let theta_our = heading
+            + omega * t_align
+            + s * max_ang_accel
+                * (2.0 * t * t_align - t * t - 0.5 * t_align * t_align
+                    + (t - 0.5 * t_align) * TICK_LENGTH);
+
         target_heading_unwrapped - theta_our
     };
 
     let df = |t_align: f64| {
-        let p_rel = target_pos - our_pos 
-            + (target_vel - our_vel) * t_align 
+        let p_rel = target_pos - our_pos
+            + (target_vel - our_vel) * t_align
             + 0.5 * (target_accel - our_accel) * t_align * (t_align + TICK_LENGTH);
         let r_len_sq = p_rel.dot(p_rel);
-        
+
         let (target_omega, alpha_target) = if r_len_sq > 1e-6 {
             let v_rel = target_vel - our_vel + (target_accel - our_accel) * t_align;
             let a_rel = target_accel - our_accel;
@@ -182,10 +200,10 @@ pub fn quick_turn_torque_kinematic_impl(
         } else {
             (0.0, 0.0)
         };
-        
+
         let t = 0.5 * (t_align + (target_omega - omega) / (s * max_ang_accel));
         let t_dec = t_align - t;
-        
+
         -(s * max_ang_accel + alpha_target) * t_dec - 0.5 * alpha_target * TICK_LENGTH
     };
 
@@ -217,8 +235,8 @@ pub fn quick_turn_torque_kinematic_impl(
     let t_align = clamp(solved_t_align);
 
     // Compute the duration of the acceleration phase
-    let p_rel = target_pos - our_pos 
-        + (target_vel - our_vel) * t_align 
+    let p_rel = target_pos - our_pos
+        + (target_vel - our_vel) * t_align
         + 0.5 * (target_accel - our_accel) * t_align * (t_align + TICK_LENGTH);
     let r_len_sq = p_rel.dot(p_rel);
     let target_omega = if r_len_sq > 1e-6 {
@@ -278,10 +296,13 @@ pub fn quick_turn_kinematic(
     target_accel: Vec2,
     our_accel: Vec2,
 ) {
-    torque(quick_turn_torque_kinematic(target_pos, target_vel, target_accel, our_accel));
+    torque(quick_turn_torque_kinematic(
+        target_pos,
+        target_vel,
+        target_accel,
+        our_accel,
+    ));
 }
-
-
 
 /// Calculates the clamped torque required to turn toward the target angle without overshooting.
 pub fn quick_turn_torque(target_angle: f64) -> f64 {
@@ -295,24 +316,17 @@ pub fn quick_turn_with_target_omega(target_angle: f64, target_omega: f64) {
     let unaccelerated_next_heading = heading() + omega * TICK_LENGTH;
     let diff_next = angle_diff(unaccelerated_next_heading, target_angle);
     let speed_diff = (omega - target_omega).abs();
-    
-    if diff_next.abs() <= max_ang_accel * TICK_LENGTH * TICK_LENGTH
-        && speed_diff <= max_ang_accel * TICK_LENGTH
-    {
-        debug!(
-            "Exact match with target heading expected next tick. Planned heading: {}",
-            format_sig_figs(target_angle, 6)
-        );
-    }
 
-    torque(quick_turn_torque_with_target_omega(target_angle, target_omega));
+    torque(quick_turn_torque_with_target_omega(
+        target_angle,
+        target_omega,
+    ));
 }
 
 /// Turn at the maximum possible speed for a given ship that will not overshoot the target angle.
 pub fn quick_turn(target_angle: f64) {
     quick_turn_with_target_omega(target_angle, 0.0);
 }
-
 
 /// A general Newton's method root-finding solver.
 /// Finds a value $x$ such that $f(x) \approx 0$.
@@ -351,7 +365,7 @@ where
 /// Predicts the lead direction and time-to-impact of a bullet fired
 /// from a ship at a target under constant acceleration, taking into account
 /// the discrete nature of Oort physics and gun offset.
-/// 
+///
 /// Returns `Option<(f64, Vec2)>` representing the time-to-impact and the required direction.
 pub fn predict_lead(
     our_pos: Vec2,
@@ -369,7 +383,7 @@ pub fn predict_lead(
     let dv = target_vel - our_vel;
     let v_c = -dv.dot(dp0) / r_len;
     let t0 = r_len / (bullet_speed + v_c.max(0.0));
-    
+
     let f = |t: f64| {
         let p_e = target_pos + t * target_vel + 0.5 * target_accel * t * (t + TICK_LENGTH);
         let d = p_e - our_pos - t * our_vel;
@@ -389,11 +403,7 @@ pub fn predict_lead(
     };
 
     let clamp = |t: f64| {
-        if t < 0.0 {
-            0.0
-        } else {
-            t
-        }
+        if t < 0.0 { 0.0 } else { t }
     };
 
     if let Some(t) = newton_solve(t0, f, df, clamp, 20, 1e-4) {
@@ -439,9 +449,6 @@ impl AngleTracker {
     }
 }
 
-
-
-
 /// Estimates the time to complete a turn to face a target angle and match target angular velocity,
 /// assuming we use the quick_turn_torque_with_target_omega controller.
 pub fn quick_turn_time_with_target_omega(target_angle: f64, target_omega: f64) -> f64 {
@@ -478,9 +485,7 @@ pub fn quick_turn_time_with_target_omega_pure(
     let unaccelerated_next_heading = heading + omega * TICK_LENGTH;
     let diff_next = angle_diff(unaccelerated_next_heading, target_angle);
     let speed_diff = (omega - target_omega).abs();
-    if diff_next.abs() <= a * TICK_LENGTH * TICK_LENGTH
-        && speed_diff <= a * TICK_LENGTH
-    {
+    if diff_next.abs() <= a * TICK_LENGTH * TICK_LENGTH && speed_diff <= a * TICK_LENGTH {
         return 0.0;
     }
 
@@ -503,7 +508,8 @@ pub fn quick_turn_time_with_target_omega_pure(
         let t1 = (v0 - v_target).abs() / a;
         t1 + t_settle
     } else {
-        let d = (a_dec / (a + a_dec)) * v0 * v0 + (2.0 * a * a_dec / (a + a_dec)) * (x0 - theta_offset);
+        let d =
+            (a_dec / (a + a_dec)) * v0 * v0 + (2.0 * a * a_dec / (a + a_dec)) * (x0 - theta_offset);
         let d_sqrt = d.max(0.0).sqrt();
         let t1 = ((v0 + d_sqrt) / a).max(0.0);
         let t2 = ((d_sqrt - k_p * theta_trans) / a_dec).max(0.0);
@@ -520,7 +526,7 @@ pub fn format_sig_figs(val: f64, n: usize) -> String {
     let log10_val = abs_val.log10();
     let mut d = log10_val.floor() as isize + 1;
     let mut precision = (n as isize - d).max(0) as usize;
-    
+
     let factor = 10.0f64.powi(precision as i32);
     let rounded = (abs_val * factor).round() / factor;
     if rounded != 0.0 {
@@ -531,6 +537,42 @@ pub fn format_sig_figs(val: f64, n: usize) -> String {
         }
     }
     format!("{:.1$}", val, precision)
+}
+
+/// Computes the maximum achievable velocity vector in a desired prograde heading direction,
+/// given the ship/missile's current kinematic state and the available delta-V (dv).
+pub fn max_achievable_velocity(
+    kinematic: &crate::physics::KinematicState,
+    desired_heading: Vec2,
+    available_dv: f64,
+) -> Option<Vec2> {
+    let v = kinematic.velocity;
+    let p = desired_heading;
+    let v_dot_p = v.dot(p);
+    let v_perp = v - v_dot_p * p;
+    let v_perp_len = v_perp.length();
+
+    if available_dv < v_perp_len {
+        None
+    } else {
+        let discriminant = (available_dv * available_dv - v_perp_len * v_perp_len).max(0.0);
+        let v_desired_mag = (v_dot_p + discriminant.sqrt()).max(0.0);
+        Some(p * v_desired_mag)
+    }
+}
+
+/// Computes the normalized direction of thrust required to change the current velocity vector
+/// toward the target velocity vector. Returns None if they are already matched.
+pub fn match_velocity_thrust_heading(
+    current_velocity: Vec2,
+    target_velocity: Vec2,
+) -> Option<Vec2> {
+    let dv = target_velocity - current_velocity;
+    if dv.length() > 1e-6 {
+        Some(dv.normalize())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

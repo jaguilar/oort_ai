@@ -203,7 +203,7 @@ mod aim_test {
             heading: None,
             angular_velocity: None,
         };
-        let missile_aimer = MissileAimer::new(200.0);
+        let missile_aimer = MissileAimer::new(200.0, 100.0);
         let res = missile_aimer.aim_at(&target, &us);
         assert!(res.is_some());
         let (dir, omega) = res.unwrap();
