@@ -896,6 +896,10 @@ mod fighter_duel_test {
             prioritize_scan: false,
             prev_scan_pos_uncertainty: None,
             low_improvement_consecutive_scans: 0,
+            last_beam_width: None,
+            last_beam_center: None,
+            last_beam_center_pos: None,
+            missile_scan_ticks_remaining: 0,
         }
     }
 
