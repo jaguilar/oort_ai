@@ -5,6 +5,7 @@ fn test_kalman_filter() {
     let mut contact = Contact {
         id: 0,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 20.0,
@@ -47,7 +48,8 @@ fn test_kalman_filter() {
         let meas_pos = true_pos + Vec2::new(noise_sign * sigma_p, 0.0);
         let meas_vel = true_vel + Vec2::new(-noise_sign * sigma_v, 0.0);
 
-        contact.predict_and_update(t, meas_pos, meas_vel, sigma_p, sigma_v);
+        contact.predict(t);
+        contact.update_with_measurement(meas_pos, meas_vel, sigma_p, sigma_v, t);
 
         // Check that matrix symmetry is preserved
         assert!((contact.p_cov_x[0][1] - contact.p_cov_x[1][0]).abs() < 1e-9);
@@ -73,6 +75,7 @@ fn test_radar_clamped_tracking_width() {
     let contact = Contact {
         id: 0,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 100.0,
@@ -112,6 +115,7 @@ fn test_radar_out_of_range_retained() {
     let contact_close = Contact {
         id: 1,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 1000.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 10.0,
@@ -135,6 +139,7 @@ fn test_radar_out_of_range_retained() {
     let contact_far = Contact {
         id: 2,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 200000.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 10.0,
@@ -226,6 +231,7 @@ fn test_nearby_contact_exclusion() {
     let target = Contact {
         id: 1,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 10.0,
@@ -260,6 +266,7 @@ fn test_nearby_contact_exclusion() {
     let left_contact = Contact {
         id: 2,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 30.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
         rssi: 0.0,
         snr: 30.0,
         pos_uncertainty: 1.0,
@@ -440,6 +447,7 @@ fn test_jamming_mode() {
     let contact = Contact {
         id: 42,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), current_tick()),
+        last_measurement_tick: current_tick(),
         rssi: -50.0,
         snr: 40.0,
         pos_uncertainty: 10.0,
@@ -470,9 +478,10 @@ fn test_jamming_mode() {
     select_radar(0);
     assert_eq!(radar_ecm_mode(), EcmMode::Noise);
 
-    // 2. Set last_scanned to 6 ticks ago.
+    // 2. Set last_scanned and last_measurement_tick to 6 ticks ago.
     // Now next track tick is <= current_tick, so it should trigger a tracking scan.
     rc.contacts[0].last_scanned = current_tick().wrapping_sub(6);
+    rc.contacts[0].last_measurement_tick = current_tick().wrapping_sub(6);
     rc.update();
 
     assert_eq!(rc.radar_states[0], RadarState::Tracking { contact_id: 42 });
@@ -488,6 +497,7 @@ fn test_missile_priority_scanning_threshold() {
     let contact = Contact {
         id: 100,
         kinematic: KinematicState::new(Class::Missile, Vec2::new(1000.0, 0.0), Vec2::new(-10.0, 0.0), Vec2::new(0.0, 0.0), current_tick().wrapping_sub(1)),
+        last_measurement_tick: current_tick().wrapping_sub(1),
         rssi: -50.0,
         snr: 30.0,
         pos_uncertainty: 10.0,
@@ -526,8 +536,9 @@ fn test_missile_priority_scanning_threshold() {
     assert_eq!(updated_contact_1.low_improvement_consecutive_scans, 1);
     assert_eq!(updated_contact_1.prioritize_scan, true);
 
-    // Now update last_scanned so another update can happen
+    // Now update last_scanned and last_measurement_tick so another update can happen
     rc.contacts[0].last_scanned = current_tick().wrapping_sub(1);
+    rc.contacts[0].last_measurement_tick = current_tick().wrapping_sub(1);
 
     // Call process_scan_hit a second time with low SNR scan hit
     let scan_hit_2 = ScanResult {
@@ -555,6 +566,7 @@ fn test_advanced_beam_tracking() {
     let contact_upper_bound = Contact {
         id: 1,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), current_tick().wrapping_sub(1)),
+        last_measurement_tick: current_tick().wrapping_sub(1),
         rssi: -50.0,
         snr: 40.0,
         pos_uncertainty: 1.0,
@@ -583,6 +595,7 @@ fn test_advanced_beam_tracking() {
     let contact_high_variance = Contact {
         id: 2,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 50.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), current_tick().wrapping_sub(1)),
+        last_measurement_tick: current_tick().wrapping_sub(1),
         rssi: -50.0,
         snr: 40.0,
         pos_uncertainty: 10.0,
@@ -630,6 +643,7 @@ fn test_new_missile_prioritization() {
 
     // 2. Check that the tracking job has interval = 1 and gets prioritized in tracking_jobs()
     rc.contacts[0].last_scanned = current_tick().wrapping_sub(1);
+    rc.contacts[0].last_measurement_tick = current_tick().wrapping_sub(1);
     let jobs: Vec<RadarJob> = rc.tracking_jobs().collect();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].state, RadarState::Tracking { contact_id: id });
@@ -637,6 +651,7 @@ fn test_new_missile_prioritization() {
     // 3. Process matched scans and check that ticks decrement
     // A scan hit on the next tick
     rc.contacts[0].last_scanned = current_tick().wrapping_sub(1);
+    rc.contacts[0].last_measurement_tick = current_tick().wrapping_sub(1);
     let scan_hit2 = ScanResult {
         position: Vec2::new(90.0, 0.0),
         velocity: Vec2::new(-10.0, 0.0),
@@ -658,6 +673,7 @@ fn test_tracking_beam_exclusion() {
     let contact_target = Contact {
         id: 42,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
         rssi: -50.0,
         snr: 40.0,
         pos_uncertainty: 1.0,
@@ -683,6 +699,7 @@ fn test_tracking_beam_exclusion() {
     let contact_other = Contact {
         id: 43,
         kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 200.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
         rssi: -50.0,
         snr: 40.0,
         pos_uncertainty: 10.0,

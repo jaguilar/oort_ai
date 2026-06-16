@@ -113,7 +113,7 @@ impl Fighter {
             if let Some(tid) = self.fighter_target_id {
                 debug!("Fighter {} tracking target ID: {}", id(), tid);
                 if let Some(contact) = self.radar_controller.get_contact(tid) {
-                    let ticks_since_tracked = current_tick() - contact.last_scanned;
+                    let ticks_since_tracked = current_tick() - contact.last_measurement_tick;
                     debug!("  Contact {} last scanned {} ticks ago (provisional={})", tid, ticks_since_tracked, contact.provisional);
                     debug!("  Position: {:?}", contact.current_position());
                     debug!("  Velocity: {:?}", contact.current_velocity());

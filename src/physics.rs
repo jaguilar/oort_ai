@@ -45,6 +45,19 @@ impl KinematicState {
         let dt = tick.wrapping_sub(self.last_scanned) as f64 * TICK_LENGTH;
         self.velocity + self.acceleration * dt
     }
+
+    pub fn predict(&mut self, tick: u32) {
+        let dt = tick.wrapping_sub(self.last_scanned) as f64 * TICK_LENGTH;
+        if dt <= 0.0 {
+            return;
+        }
+        self.position = self.position_at(tick);
+        self.velocity = self.velocity_at(tick);
+        if let (Some(h), Some(av)) = (&mut self.heading, self.angular_velocity) {
+            *h += av * dt;
+        }
+        self.last_scanned = tick;
+    }
 }
 
 pub fn max_acceleration_over_time(class: Class, t_go: f64) -> f64 {
