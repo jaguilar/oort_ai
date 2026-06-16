@@ -990,7 +990,7 @@ impl RadarController {
                                 contact.update_scan_boundary(s);
                             }
                             let current_unc = contact.pos_uncertainty;
-                            let pct_improvement = if predicted_unc > 0.0 {
+                            let _pct_improvement = if predicted_unc > 0.0 {
                                 (1.0 - current_unc / predicted_unc) * 100.0
                             } else {
                                 0.0
