@@ -929,3 +929,74 @@ fn test_scan_boundary() {
         assert!(job_right_rel >= min_pt_rel_angle - 1e-6);
     }
 }
+
+#[test]
+fn test_scan_cone_filtering_in_association() {
+    let mut rc = RadarController::new();
+
+    let own_pos = position();
+    let contact_pos = own_pos + Vec2::new(1000.0, 150.0); // Inside the scan cone
+
+    let contact = Contact {
+        id: 77,
+        kinematic: KinematicState::new(Class::Fighter, contact_pos, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
+        rssi: -50.0,
+        snr: 40.0,
+        pos_uncertainty: 200.0, // Large uncertainty so gate overlaps everything
+        vel_uncertainty: 1.0,
+        radar_locked: true,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(200.0, 1.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(200.0, 1.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: Some([
+            own_pos + Vec2::new(900.0, 90.0),
+            own_pos + Vec2::new(1100.0, 110.0),
+            own_pos + Vec2::new(900.0, 180.0),
+            own_pos + Vec2::new(1100.0, 220.0),
+        ]),
+        scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+    };
+    rc.contacts.push(contact);
+
+    // Scan result located inside the cone
+    let scan_hit = ScanResult {
+        position: contact_pos,
+        velocity: Vec2::new(0.0, 0.0),
+        class: Class::Fighter,
+        rssi: -50.0,
+        snr: 30.0,
+    };
+    let scan_ci_radius = 10.0;
+
+    // 1. Slice that does NOT intersect the scan cone: angle = 0.0, width = 0.1
+    let slice_no_intersect = Some(ScanSlice {
+        angle: 0.0,
+        width: 0.1,
+        min_distance: 900.0,
+        max_distance: 1100.0,
+    });
+    let res_no_intersect = rc.find_best_matching_contact(&scan_hit, scan_ci_radius, slice_no_intersect, 0, 1.0);
+    assert_eq!(res_no_intersect, None, "Contact should be filtered out because scan cone does not intersect radar beam");
+
+    // 2. Slice that DOES intersect the scan cone: angle = 0.15, width = 0.1
+    let slice_intersect = Some(ScanSlice {
+        angle: 0.15,
+        width: 0.1,
+        min_distance: 900.0,
+        max_distance: 1100.0,
+    });
+    let res_intersect = rc.find_best_matching_contact(&scan_hit, scan_ci_radius, slice_intersect, 0, 1.0);
+    assert_eq!(res_intersect.map(|(id, _)| id), Some(77), "Contact should match because scan cone intersects radar beam");
+}
+

@@ -1533,6 +1533,31 @@ impl RadarController {
             }
 
             if let Some(s) = slice {
+                if let Some(pts) = contact.scan_boundary_points {
+                    let mut min_pt_dist = f64::MAX;
+                    let mut max_pt_dist = -f64::MAX;
+                    let mut min_rel_angle = f64::MAX;
+                    let mut max_rel_angle = -f64::MAX;
+
+                    for pt in &pts {
+                        let to_pt = *pt - position();
+                        let d_pt = to_pt.length();
+                        min_pt_dist = min_pt_dist.min(d_pt);
+                        max_pt_dist = max_pt_dist.max(d_pt);
+
+                        let rel_angle = normalize_angle(to_pt.angle() - s.angle);
+                        min_rel_angle = min_rel_angle.min(rel_angle);
+                        max_rel_angle = max_rel_angle.max(rel_angle);
+                    }
+
+                    let d_overlap = max_pt_dist >= s.min_distance && min_pt_dist <= s.max_distance;
+                    let a_overlap = max_rel_angle >= -s.width / 2.0 && min_rel_angle <= s.width / 2.0;
+
+                    if !(d_overlap && a_overlap) {
+                        continue;
+                    }
+                }
+
                 let gate_radius = contact.ci_mult() * contact.current_pos_uncertainty();
                 let contact_pos = contact.current_position();
                 let v = contact_pos - position();
