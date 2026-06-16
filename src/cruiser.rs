@@ -184,7 +184,10 @@ impl Cruiser {
                 priority_ids.push(tid);
             }
         }
-        self.radar_controller.priority_targets = priority_ids;
+        self.radar_controller.priority_target_frequencies = priority_ids
+            .into_iter()
+            .map(|id| (id, 6.0 * TICK_LENGTH))
+            .collect();
         self.radar_controller.update();
         self.missile_sender.send_missile_contact(self.radar_controller.contacts());
 

@@ -454,7 +454,7 @@ fn test_missile_priority_scanning_initialization() {
 fn test_jamming_mode() {
     let mut rc = RadarController::new();
     rc.jamming_mode = true;
-    rc.priority_targets = vec![42];
+    rc.priority_target_frequencies = vec![(42, 6.0 * TICK_LENGTH)];
 
     let contact = Contact {
         id: 42,
@@ -999,4 +999,62 @@ fn test_scan_cone_filtering_in_association() {
     let res_intersect = rc.find_best_matching_contact(&scan_hit, scan_ci_radius, slice_intersect, 0, 1.0);
     assert_eq!(res_intersect.map(|(id, _)| id), Some(77), "Contact should match because scan cone intersects radar beam");
 }
+
+#[test]
+fn test_custom_tracking_frequency() {
+    let mut rc = RadarController::new();
+
+    let mut contact = Contact {
+        id: 101,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), current_tick()),
+        last_measurement_tick: current_tick(),
+        rssi: -50.0,
+        snr: 40.0,
+        pos_uncertainty: 10.0,
+        vel_uncertainty: 1.0,
+        radar_locked: true,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(10.0, 1.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(10.0, 1.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
+    };
+
+    rc.priority_target_frequencies = vec![(101, 0.2)]; // 0.2s = 12 ticks
+
+    // Scenario A: Only 11 ticks elapsed (less than 12) -> should NOT track
+    contact.last_measurement_tick = current_tick().wrapping_sub(11);
+    rc.contacts = vec![contact.clone()];
+    let jobs: Vec<_> = rc.tracking_jobs().collect();
+    assert!(jobs.is_empty(), "Should not track target if interval has not elapsed (11 ticks)");
+
+    // Scenario B: 12 ticks elapsed (exactly 12) -> should track
+    contact.last_measurement_tick = current_tick().wrapping_sub(12);
+    rc.contacts = vec![contact.clone()];
+    let jobs: Vec<_> = rc.tracking_jobs().collect();
+    assert_eq!(jobs.len(), 1, "Should track target if interval has elapsed (12 ticks)");
+
+    // Scenario C: Custom frequency of 0.05s = 3 ticks
+    rc.priority_target_frequencies = vec![(101, 0.05)];
+    contact.last_measurement_tick = current_tick().wrapping_sub(2);
+    rc.contacts = vec![contact.clone()];
+    let jobs: Vec<_> = rc.tracking_jobs().collect();
+    assert!(jobs.is_empty(), "Should not track target if custom interval has not elapsed (2 ticks)");
+
+    contact.last_measurement_tick = current_tick().wrapping_sub(3);
+    rc.contacts = vec![contact.clone()];
+    let jobs: Vec<_> = rc.tracking_jobs().collect();
+    assert_eq!(jobs.len(), 1, "Should track target if custom interval has elapsed (3 ticks)");
+}
+
 

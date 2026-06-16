@@ -98,7 +98,6 @@ impl Ship {
     pub fn new() -> Ship {
         let mut rc = RadarController::new();
         rc.slice_generator = Box::new(GunneryScanSliceGenerator::new(30000.0));
-        rc.priority_track_interval = 3;
 
         Ship {
             radar_controller: rc,
@@ -136,7 +135,10 @@ impl Ship {
         if let Some(tid) = self.weapon_target {
             priority_ids.push(tid);
         }
-        self.radar_controller.priority_targets = priority_ids;
+        self.radar_controller.priority_target_frequencies = priority_ids
+            .into_iter()
+            .map(|id| (id, 3.0 * TICK_LENGTH))
+            .collect();
 
         // 2. Update radar scheduler and contact database
         self.radar_controller.update();

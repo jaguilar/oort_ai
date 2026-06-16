@@ -53,9 +53,10 @@ impl Fighter {
         debug!("Fighter ID: {}", id());
         debug!("Position: {:?}", position());
 
-        if let Some(tid) = self.fighter_target_id {
-            self.radar_controller.priority_targets = vec![tid];
-        }
+        self.radar_controller.priority_target_frequencies = self
+            .fighter_target_id
+            .map(|tid| vec![(tid, 6.0 * TICK_LENGTH)])
+            .unwrap_or_default();
 
         let target_idx = (id() as i32) - 2; // Fighter 2 -> 0, Fighter 3 -> 1, Fighter 4 -> 2
         let mut received_msg = None;

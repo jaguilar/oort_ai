@@ -187,7 +187,10 @@ impl Ship {
                 }
             }
         }
-        self.radar_controller.priority_targets = priority_ids;
+        self.radar_controller.priority_target_frequencies = priority_ids
+            .into_iter()
+            .map(|id| (id, 6.0 * TICK_LENGTH))
+            .collect();
 
         // 1. Update radar scheduler and contact database
         self.radar_controller.update();

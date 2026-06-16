@@ -127,30 +127,15 @@ fn can_missile_intercept(missile: &KinematicState, target: &KinematicState) -> b
     // Draw steerable zone circle (including bullet spread) centered at p_missile_center in green
     draw_polygon(p_missile_center, d_max, 32, 0.0, rgb(0, 255, 0));
 
-    if is_threat {
-        // Draw threat line in red
+    {
+        let color = if is_threat {
+            rgb(255, 0, 0)
+        } else {
+            rgb(0, 255, 0)
+        };
         draw_line(missile_pos, p_target, rgb(255, 0, 0));
         draw_diamond(p_target, 20.0, rgb(255, 0, 0));
-        draw_text!(
-            missile_pos + vec2(0.0, 30.0),
-            rgb(255, 0, 0),
-            "THREAT t_go:{:.1}s d_steer:{:.1} d_max:{:.1}",
-            t_go,
-            d_steer,
-            d_max
-        );
-    } else {
-        // Draw safe line in green
-        draw_line(missile_pos, p_target, rgb(0, 255, 0));
-        draw_diamond(p_target, 15.0, rgb(0, 255, 0));
-        draw_text!(
-            missile_pos + vec2(0.0, 30.0),
-            rgb(0, 255, 0),
-            "SAFE t_go:{:.1}s d_steer:{:.1} d_max:{:.1}",
-            t_go,
-            d_steer,
-            d_max
-        );
+        draw_text!(missile_pos + vec2(0.0, 30.0), color, "t_go:{:.1}s", t_go);
     }
 
     is_threat
@@ -285,17 +270,57 @@ impl Ship {
             // --- Magazine Tracking ---
             debug!("Magazine bullets: {}", self.gun0.bullets_in_magazine());
 
-            // 0. Update priority targets: main enemy and closing missiles
-            let mut priority_ids = Vec::new();
+            // 0. Update priority targets based on point defense, threats, and ships
+            let mut priority_freqs = Vec::new();
+
+            // Point defense target (scanned every 4/60 seconds)
+            if let Some(pd_id) = self.pd_target_id {
+                priority_freqs.push((pd_id, 4.0 / 60.0));
+            }
+
+            // Other threat missiles incoming in the next 4 seconds (scanned every 1/6th of a second)
+            let our_kin = KinematicState::new(
+                Class::Fighter,
+                position(),
+                velocity(),
+                Vec2::new(0.0, 0.0),
+                current_tick(),
+            );
+            for c in self.radar_controller.contacts().iter().filter(|c| c.class == Class::Missile) {
+                if Some(c.id) == self.pd_target_id {
+                    continue;
+                }
+                let r = c.current_position() - position();
+                let dist = r.length();
+                if dist > 0.0 {
+                    let v_rel = c.current_velocity() - velocity();
+                    let closing = -r.dot(v_rel) / dist;
+                    if closing > 0.0 {
+                        let t_intercept = dist / closing;
+                        if t_intercept <= 4.0 {
+                            if can_missile_intercept(&c.kinematic, &our_kin) {
+                                priority_freqs.push((c.id, 1.0 / 6.0));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Non-missile enemy ships (scanned every 1/6th of a second)
+            for c in self.radar_controller.contacts().iter() {
+                if c.class != Class::Missile && c.class != Class::Torpedo {
+                    if Some(c.id) != self.pd_target_id {
+                        priority_freqs.push((c.id, 1.0 / 6.0));
+                    }
+                }
+            }
             if let Some(fid) = self.fighter_target_id {
-                priority_ids.push(fid);
+                if !priority_freqs.iter().any(|&(id, _)| id == fid) {
+                    priority_freqs.push((fid, 1.0 / 6.0));
+                }
             }
-            let threat_ids =
-                filter_missile_threats(self.radar_controller.contacts(), position(), velocity());
-            for tid in threat_ids {
-                priority_ids.push(tid);
-            }
-            self.radar_controller.priority_targets = priority_ids;
+
+            self.radar_controller.priority_target_frequencies = priority_freqs;
 
             // 1. Update radar scheduler and contact database
             self.radar_controller.update();
@@ -855,24 +880,33 @@ impl Ship {
         best_pd_missile: &Option<(Contact, f64, Vec2, f64)>,
         us_kinematic: &KinematicState,
     ) {
-        let Some((p_angle, p_omega)) = pd_aim_info else { return; };
+        let Some((p_angle, p_omega)) = pd_aim_info else {
+            return;
+        };
         if desired_heading != p_angle || target_omega_opt != Some(p_omega) {
             return;
         }
-        let Some((c, _, _, _)) = best_pd_missile else { return; };
+        let Some((c, _, _, _)) = best_pd_missile else {
+            return;
+        };
         debug!(
             "PD Aim Inputs (Us) - pos=[{:.1}, {:.1}] vel=[{:.1}, {:.1}] heading={:.3} omega={:.3}",
-            us_kinematic.position.x, us_kinematic.position.y,
-            us_kinematic.velocity.x, us_kinematic.velocity.y,
+            us_kinematic.position.x,
+            us_kinematic.position.y,
+            us_kinematic.velocity.x,
+            us_kinematic.velocity.y,
             us_kinematic.heading.unwrap_or(0.0),
             us_kinematic.angular_velocity.unwrap_or(0.0)
         );
         debug!(
             "PD Aim Inputs (Missile #{}) - pos=[{:.1}, {:.1}] vel=[{:.1}, {:.1}] acc=[{:.1}, {:.1}]",
             c.id,
-            c.kinematic.position.x, c.kinematic.position.y,
-            c.kinematic.velocity.x, c.kinematic.velocity.y,
-            c.kinematic.acceleration.x, c.kinematic.acceleration.y
+            c.kinematic.position.x,
+            c.kinematic.position.y,
+            c.kinematic.velocity.x,
+            c.kinematic.velocity.y,
+            c.kinematic.acceleration.x,
+            c.kinematic.acceleration.y
         );
     }
 

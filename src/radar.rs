@@ -86,7 +86,6 @@ pub struct Contact {
     pub snr: f64,
     pub pos_uncertainty: f64,
     pub vel_uncertainty: f64,
-    pub radar_locked: bool,
     pub provisional: bool,
     pub tracking_retry_count: u32,
     pub confirmation_attempts: u32,
@@ -590,8 +589,7 @@ pub struct RadarController {
     tracking_width: f64,
     gate_radius: f64,
     pub full_scans: u32,
-    pub priority_targets: Vec<u32>,
-    pub priority_track_interval: u32,
+    pub priority_target_frequencies: Vec<(u32, f64)>,
     scan_ticks: u32,
     last_scan_heading: Option<f64>,
     pub slice_generator: Box<dyn ScanSliceGenerator>,
@@ -615,14 +613,39 @@ impl RadarController {
             tracking_width,
             gate_radius,
             full_scans: 0,
-            priority_targets: Vec::new(),
-            priority_track_interval: 6,
+            priority_target_frequencies: Vec::new(),
             scan_ticks: 0,
             last_scan_heading: None,
             slice_generator: Box::new(DefaultScanSliceGenerator::new(search_width, max_distance)),
             jamming_mode: false,
             new_missile_scan_ticks: 8,
         }
+    }
+
+    fn is_priority_target(&self, contact_id: u32) -> bool {
+        self.priority_target_frequencies
+            .iter()
+            .any(|&(id, _)| id == contact_id)
+    }
+
+    fn tracking_interval(&self, contact: &Contact) -> u32 {
+        let is_new_missile =
+            contact.class == Class::Missile && contact.missile_scan_ticks_remaining > 0;
+        if is_new_missile {
+            return 1;
+        }
+
+        if let Some(&(_, freq)) = self
+            .priority_target_frequencies
+            .iter()
+            .find(|&&(id, _)| id == contact.id)
+        {
+            let ticks = (freq / TICK_LENGTH).round() as u32;
+            return ticks.max(1);
+        }
+
+        let is_priority = contact.provisional || contact.prioritize_scan;
+        if is_priority { 6 } else { 20 }
     }
 
     pub fn add_radio_ping(&mut self, telemetry: TargetTelemetry) -> u32 {
@@ -667,33 +690,6 @@ impl RadarController {
                 .iter_mut()
                 .find(|co| co.id == best_id)
                 .unwrap();
-            let ci_radius = contact.ci_mult() * contact.current_pos_uncertainty();
-            if best_dist > ci_radius.max(10.0) && best_dist > 20.0 {
-                let stats = contact.class.default_stats();
-                let mut max_acc = stats
-                    .max_forward_acceleration
-                    .max(stats.max_backward_acceleration)
-                    .max(stats.max_lateral_acceleration);
-                if contact.class == Class::Fighter || contact.class == Class::Missile {
-                    max_acc += 100.0;
-                }
-                let dt_sec =
-                    current_t.wrapping_sub(contact.last_measurement_tick) as f64 * TICK_LENGTH;
-                let fallback = 0.5 * max_acc * dt_sec * dt_sec;
-                let gate_radius = ci_radius.max(10.0) + fallback;
-                if best_dist > gate_radius {
-                    debug!(
-                        "Scan hit for contact {} was outside contact's CI and moved position by {:.1}m (>20m), associated because it is within scan's 99.99% CI ({:.1}m)",
-                        contact.id, best_dist, scan_ci_radius
-                    );
-                } else {
-                    debug!(
-                        "Scan hit for contact {} was outside CI and moved position by {:.1}m (>20m), associated due to dynamic gating fallback ({:.1}m based on max accel {:.1}m/s^2 and dt={:.3}s)",
-                        contact.id, best_dist, fallback, max_acc, dt_sec
-                    );
-                }
-            }
-
             let error_factor = 10.0f64.powf(-c.snr / 10.0);
             let dist = position().distance(c.position);
             let sigma_r = 10000.0 * error_factor;
@@ -732,7 +728,6 @@ impl RadarController {
             contact.prev_scan_pos_uncertainty = Some(contact.pos_uncertainty);
             contact.rssi = c.rssi;
             contact.snr = c.snr;
-            contact.radar_locked = true;
             contact.tracking_retry_count = 0;
             if c.snr == RADIO_PING_SNR {
                 contact.provisional = false; // Confirm immediately if it is a radio ping
@@ -774,7 +769,6 @@ impl RadarController {
                 snr: c.snr,
                 pos_uncertainty: pos_unc,
                 vel_uncertainty: vel_unc,
-                radar_locked: true,
                 provisional: c.snr != RADIO_PING_SNR, // Confirm immediately if it is a radio ping
                 tracking_retry_count: 0,
                 confirmation_attempts: 0,
@@ -1018,7 +1012,6 @@ impl RadarController {
                             contact.prev_scan_pos_uncertainty = Some(contact.pos_uncertainty);
                             contact.rssi = c.rssi;
                             contact.snr = c.snr;
-                            contact.radar_locked = true;
                             contact.tracking_retry_count = 0;
                             if let Some(s) = self.prev_slices[i] {
                                 contact.last_beam_width = Some(s.width);
@@ -1167,7 +1160,6 @@ impl RadarController {
                                     snr: c.snr,
                                     pos_uncertainty: pos_unc,
                                     vel_uncertainty: vel_unc,
-                                    radar_locked: true,
                                     provisional: true,
                                     tracking_retry_count: 0,
                                     confirmation_attempts: 0,
@@ -1325,11 +1317,11 @@ impl RadarController {
                     min_distance: job.min_distance,
                     max_distance: job.max_distance,
                 });
-            } else if self.jamming_mode && !self.priority_targets.is_empty() {
+            } else if self.jamming_mode && !self.priority_target_frequencies.is_empty() {
                 let high_priority_contacts: Vec<&Contact> = self
                     .contacts
                     .iter()
-                    .filter(|c| self.priority_targets.contains(&c.id))
+                    .filter(|c| self.is_priority_target(c.id))
                     .collect();
 
                 let mut jammed = false;
@@ -1436,20 +1428,16 @@ impl RadarController {
         let current_t = current_tick();
         let mut tracking_contacts = Vec::new();
 
-        if self.jamming_mode && !self.priority_targets.is_empty() {
+        if self.jamming_mode && !self.priority_target_frequencies.is_empty() {
             for contact in &self.contacts {
                 let is_new_missile =
                     contact.class == Class::Missile && contact.missile_scan_ticks_remaining > 0;
-                let is_priority_target = self.priority_targets.contains(&contact.id);
+                let is_priority_target = self.is_priority_target(contact.id);
                 if !is_new_missile && !is_priority_target {
                     continue;
                 }
                 let priority_group = if is_new_missile { 0 } else { 1 };
-                let interval = if is_new_missile {
-                    1
-                } else {
-                    self.priority_track_interval
-                };
+                let interval = self.tracking_interval(contact);
                 let next_track_tick = if contact.provisional {
                     current_t
                 } else {
@@ -1466,7 +1454,7 @@ impl RadarController {
             for contact in &self.contacts {
                 let is_new_missile =
                     contact.class == Class::Missile && contact.missile_scan_ticks_remaining > 0;
-                let is_priority = self.priority_targets.contains(&contact.id)
+                let is_priority = self.is_priority_target(contact.id)
                     || contact.provisional
                     || contact.prioritize_scan;
                 let priority_group = if is_new_missile {
@@ -1476,13 +1464,7 @@ impl RadarController {
                 } else {
                     2
                 };
-                let interval = if is_new_missile {
-                    1
-                } else if is_priority {
-                    self.priority_track_interval
-                } else {
-                    20
-                };
+                let interval = self.tracking_interval(contact);
                 let next_track_tick = if contact.provisional {
                     current_t
                 } else {

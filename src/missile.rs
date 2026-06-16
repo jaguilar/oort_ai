@@ -220,8 +220,10 @@ impl MissileGuidance {
         }
 
         // 2. Update radar
-        self.radar_controller.priority_targets =
-            self.target_id.map(|id| vec![id]).unwrap_or_default();
+        self.radar_controller.priority_target_frequencies = self
+            .target_id
+            .map(|id| vec![(id, 6.0 * TICK_LENGTH)])
+            .unwrap_or_default();
         self.radar_controller.update();
         let contacts = self.radar_controller.contacts();
 
