@@ -862,21 +862,21 @@ impl RadarController {
     }
 
     pub fn update(&mut self) {
-        let current_t = current_tick();
-
-        self.predict(current_t);
-        let hit_seen_this_tick = self.process_scans(current_t);
-        self.cleanup(current_t);
-        self.generate_new_scans(current_t, hit_seen_this_tick);
+        self.predict();
+        let hit_seen_this_tick = self.process_scans();
+        self.cleanup();
+        self.generate_new_scans(hit_seen_this_tick);
     }
 
-    fn predict(&mut self, current_t: u32) {
+    fn predict(&mut self) {
+        let current_t = current_tick();
         for contact in &mut self.contacts {
             contact.predict(current_t);
         }
     }
 
-    fn process_scans(&mut self, current_t: u32) -> bool {
+    fn process_scans(&mut self) -> bool {
+        let current_t = current_tick();
         let num_radars = self.num_radars();
         let mut hit_seen_this_tick = false;
 
@@ -1266,7 +1266,8 @@ impl RadarController {
         hit_seen_this_tick
     }
 
-    fn cleanup(&mut self, current_t: u32) {
+    fn cleanup(&mut self) {
+        let current_t = current_tick();
         // Update unscanned_in_range_ticks
         for contact in &mut self.contacts {
             if contact.last_measurement_tick == current_t {
@@ -1322,7 +1323,8 @@ impl RadarController {
 
     }
 
-    fn generate_new_scans(&mut self, current_t: u32, hit_seen_this_tick: bool) {
+    fn generate_new_scans(&mut self, hit_seen_this_tick: bool) {
+        let current_t = current_tick();
         let num_radars = self.num_radars();
         // 4. Generate jobs for next tick
         let tracking_jobs: Vec<RadarJob> = self.tracking_jobs().collect();
