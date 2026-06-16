@@ -104,10 +104,12 @@ fn can_missile_intercept(missile: &KinematicState, target: &KinematicState) -> b
     let d_steer = v_rel_perp.abs() * t_go;
 
     // Calculate max bullet displacement at t_go factoring in detonation 0.2s before impact
-    let d_max = if t_go > 0.2 {
-        0.5 * max_lat_acc * (t_go - 0.2).powi(2) + 100.0
+    let explode_time = 0.2;
+    let explode_vel = 750.0;
+    let d_max = if t_go > explode_time {
+        0.5 * max_lat_acc * (t_go - explode_time).powi(2) + explode_vel * explode_time
     } else {
-        500.0 * t_go
+        explode_vel * t_go
     };
 
     let is_threat = d_max >= d_steer;
