@@ -857,7 +857,7 @@ impl RadarController {
         }
     }
 
-        fn num_radars(&self) -> usize {
+    fn num_radars(&self) -> usize {
         if class() == Class::Cruiser { 2 } else { 1 }
     }
 
@@ -1001,49 +1001,18 @@ impl RadarController {
                             } else {
                                 0.0
                             };
-                            debug!(
-                                "Contact {} uncertainty improved by {:.1}% on subsequent tick (predicted CI: {:.2}m -> updated CI: {:.2}m)",
-                                contact.id,
-                                pct_improvement,
-                                contact.ci_mult() * predicted_unc,
-                                contact.ci_mult() * current_unc
-                            );
                             if contact.prioritize_scan {
                                 let current_unc = contact.pos_uncertainty;
                                 let shrink_ratio = current_unc / prev_unc;
                                 let improvement_pct = (1.0 - shrink_ratio) * 100.0;
                                 if improvement_pct < 5.0 {
                                     contact.low_improvement_consecutive_scans += 1;
-                                    debug!(
-                                        "Contact {} (Missile) CI went from {:.2} to {:.2}. Shrink was {:.1}% (<5.0% threshold). Low-improvement scans: {}.",
-                                        contact.id,
-                                        contact.ci_mult() * prev_unc,
-                                        contact.ci_mult() * current_unc,
-                                        improvement_pct,
-                                        contact.low_improvement_consecutive_scans
-                                    );
                                 } else {
                                     contact.low_improvement_consecutive_scans = 0;
-                                    debug!(
-                                        "Contact {} (Missile) CI went from {:.2} to {:.2}. Shrink was {:.1}% (>=5.0%). Reset low-improvement counter.",
-                                        contact.id,
-                                        contact.ci_mult() * prev_unc,
-                                        contact.ci_mult() * current_unc,
-                                        improvement_pct
-                                    );
                                 }
 
                                 if contact.low_improvement_consecutive_scans >= 2 {
                                     contact.prioritize_scan = false;
-                                    debug!(
-                                        "Contact {} (Missile) reached 2 consecutive low-improvement tracking scans. Stop prioritizing.",
-                                        contact.id
-                                    );
-                                } else {
-                                    debug!(
-                                        "Contact {} (Missile) is still improving (low-improvement count: {}). Keep prioritizing.",
-                                        contact.id, contact.low_improvement_consecutive_scans
-                                    );
                                 }
                             }
                             contact.prev_scan_pos_uncertainty = Some(contact.pos_uncertainty);
@@ -1262,7 +1231,6 @@ impl RadarController {
             }
         }
 
-
         hit_seen_this_tick
     }
 
@@ -1320,7 +1288,6 @@ impl RadarController {
             }
             keep
         });
-
     }
 
     fn generate_new_scans(&mut self, hit_seen_this_tick: bool) {
@@ -1576,7 +1543,8 @@ impl RadarController {
                     }
 
                     let d_overlap = max_pt_dist >= s.min_distance && min_pt_dist <= s.max_distance;
-                    let a_overlap = max_rel_angle >= -s.width / 2.0 && min_rel_angle <= s.width / 2.0;
+                    let a_overlap =
+                        max_rel_angle >= -s.width / 2.0 && min_rel_angle <= s.width / 2.0;
 
                     if !(d_overlap && a_overlap) {
                         continue;
@@ -1708,7 +1676,9 @@ impl RadarController {
         };
 
         let constrain_job = |job: &mut RadarJob| {
-            if let (Some(pts), Some(vels)) = (contact.scan_boundary_points, contact.scan_boundary_vels) {
+            if let (Some(pts), Some(vels)) =
+                (contact.scan_boundary_points, contact.scan_boundary_vels)
+            {
                 let mut projected_pts = [Vec2::new(0.0, 0.0); 4];
                 for j in 0..4 {
                     projected_pts[j] = pts[j] + vels[j] * TICK_LENGTH;
@@ -1746,7 +1716,10 @@ impl RadarController {
                 let (new_width, new_center_rel) = if new_rel_left - new_rel_right < w_min {
                     (w_min, (min_rel_angle + max_rel_angle) / 2.0)
                 } else {
-                    (new_rel_left - new_rel_right, (new_rel_left + new_rel_right) / 2.0)
+                    (
+                        new_rel_left - new_rel_right,
+                        (new_rel_left + new_rel_right) / 2.0,
+                    )
                 };
 
                 job.width = new_width;

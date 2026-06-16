@@ -317,10 +317,28 @@ pub fn quick_turn_with_target_omega(target_angle: f64, target_omega: f64) {
     let _diff_next = angle_diff(unaccelerated_next_heading, target_angle);
     let _speed_diff = (omega - target_omega).abs();
 
-    torque(quick_turn_torque_with_target_omega(
-        target_angle,
-        target_omega,
-    ));
+    let p = position();
+    draw_line(
+        p,
+        p + vec2(target_angle.cos(), target_angle.sin()) * 1000.0,
+        rgb(0, 255, 0),
+    );
+    draw_line(
+        p,
+        p + vec2(heading().cos(), heading().sin()) * 1000.0,
+        rgb(0, 0, 255),
+    );
+    let cmd_torque = quick_turn_torque_with_target_omega(target_angle, target_omega);
+    debug!(
+        "qt: h={} t={} w={} tw={} => {}",
+        heading().to_degrees() as i32,
+        target_angle.to_degrees() as i32,
+        angular_velocity().to_degrees() as i32,
+        target_omega.to_degrees() as i32,
+        cmd_torque.to_degrees() as i32
+    );
+
+    torque(cmd_torque);
 }
 
 /// Turn at the maximum possible speed for a given ship that will not overshoot the target angle.

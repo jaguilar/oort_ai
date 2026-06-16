@@ -46,6 +46,19 @@ impl KinematicState {
         self.velocity + self.acceleration * dt
     }
 
+    /// Predict position using a continuous time offset (seconds) from `last_scanned`.
+    /// Use this inside Newton solver closures where rounding `t` to a tick would create
+    /// a staircase function and break convergence.
+    /// The final intercept position should still use `position_at` to match game physics.
+    pub fn position_at_dt(&self, dt: f64) -> Vec2 {
+        self.position + self.velocity * dt + 0.5 * self.acceleration * dt * dt
+    }
+
+    /// Predict velocity using a continuous time offset (seconds) from `last_scanned`.
+    pub fn velocity_at_dt(&self, dt: f64) -> Vec2 {
+        self.velocity + self.acceleration * dt
+    }
+
     pub fn predict(&mut self, tick: u32) {
         let dt = tick.wrapping_sub(self.last_scanned) as f64 * TICK_LENGTH;
         if dt <= 0.0 {

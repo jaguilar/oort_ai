@@ -646,6 +646,10 @@ impl Ship {
                     "POINT DEFENSE: intercepting incoming missile ID {} in {:.2}s (bullets fired: {})",
                     c.0.id, c.1, self.pd_bullets_fired
                 );
+                if let Some(ref sol) = pd_solution {
+                    draw_line(position(), sol.intercept_pos, rgb(255, 0, 0));
+                    draw_diamond(sol.intercept_pos, 20.0, rgb(255, 0, 0));
+                }
             }
 
             let mut gun_solution = None;
@@ -718,6 +722,14 @@ impl Ship {
                 missile_aim_info,
                 acc_cmd,
                 is_reversing_orbit,
+            );
+
+            self.log_pd_aim_inputs(
+                pd_aim_info,
+                desired_heading,
+                target_omega_opt,
+                &best_pd_missile,
+                &us_kinematic,
             );
 
             // Fire main gun (slot 0)
@@ -833,6 +845,35 @@ impl Ship {
             self.gun0.draw_debug();
             self.gun1.draw_debug();
         }
+    }
+
+    fn log_pd_aim_inputs(
+        &self,
+        pd_aim_info: Option<(f64, f64)>,
+        desired_heading: f64,
+        target_omega_opt: Option<f64>,
+        best_pd_missile: &Option<(Contact, f64, Vec2, f64)>,
+        us_kinematic: &KinematicState,
+    ) {
+        let Some((p_angle, p_omega)) = pd_aim_info else { return; };
+        if desired_heading != p_angle || target_omega_opt != Some(p_omega) {
+            return;
+        }
+        let Some((c, _, _, _)) = best_pd_missile else { return; };
+        debug!(
+            "PD Aim Inputs (Us) - pos=[{:.1}, {:.1}] vel=[{:.1}, {:.1}] heading={:.3} omega={:.3}",
+            us_kinematic.position.x, us_kinematic.position.y,
+            us_kinematic.velocity.x, us_kinematic.velocity.y,
+            us_kinematic.heading.unwrap_or(0.0),
+            us_kinematic.angular_velocity.unwrap_or(0.0)
+        );
+        debug!(
+            "PD Aim Inputs (Missile #{}) - pos=[{:.1}, {:.1}] vel=[{:.1}, {:.1}] acc=[{:.1}, {:.1}]",
+            c.id,
+            c.kinematic.position.x, c.kinematic.position.y,
+            c.kinematic.velocity.x, c.kinematic.velocity.y,
+            c.kinematic.acceleration.x, c.kinematic.acceleration.y
+        );
     }
 
     fn compute_desired_heading(

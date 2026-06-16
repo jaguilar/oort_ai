@@ -106,14 +106,16 @@ impl FireControl {
                     let v_rel = target.velocity - us.velocity;
                     let v_c = -v_rel.dot(dp0) / r_len;
                     let t_intercept = r_len / (bullet_speed + v_c.max(0.0));
-                    let intercept_pos = target.position_at(current_tick() + (t_intercept / TICK_LENGTH).round() as u32);
+                    let dt_base = current_tick().wrapping_sub(target.last_scanned) as f64 * TICK_LENGTH;
+                    let intercept_pos = target.position_at_dt(dt_base + t_intercept);
                     (intercept_pos, t_intercept)
                 }
             }
             1 => {
                 let d = (target.position - us.position).length();
                 let t_intercept = d / 750.0;
-                let intercept_pos = target.position_at(current_tick() + (t_intercept / TICK_LENGTH).round() as u32);
+                let dt_base = current_tick().wrapping_sub(target.last_scanned) as f64 * TICK_LENGTH;
+                let intercept_pos = target.position_at_dt(dt_base + t_intercept);
                 (intercept_pos, t_intercept)
             }
             _ => (target.position, 0.0),
@@ -210,21 +212,25 @@ impl AimAt for GunAimer {
         let dv = target_vel - us.velocity;
         let v_c = -dv.dot(dp0) / r_len;
         let t0 = r_len / (self.bullet_speed + v_c.max(0.0));
-        
+
+        // dt_base: continuous-time offset (seconds) from target.last_scanned to current_tick.
+        // Adding the solver's `t` to this gives a smooth float for continuous prediction,
+        // avoiding the staircase discontinuities that arise from rounding t to a tick number.
+        let dt_base = current_tick().wrapping_sub(target.last_scanned) as f64 * TICK_LENGTH;
+
         let f = |t: f64| {
-            let tick_at_t = current_tick() + (t / TICK_LENGTH).round() as u32;
-            let p_e = target.position_at(tick_at_t);
+            let p_e = target.position_at_dt(dt_base + t);
             let d = p_e - gun_pos - t * us.velocity;
             d.length() - self.bullet_speed * t
         };
 
         let df = |t: f64| {
-            let tick_at_t = current_tick() + (t / TICK_LENGTH).round() as u32;
-            let p_e = target.position_at(tick_at_t);
+            let p_e = target.position_at_dt(dt_base + t);
             let d = p_e - gun_pos - t * us.velocity;
             let d_len = d.length();
-            let target_vel_at_t = target.velocity_at(tick_at_t);
-            let d_prime = target_vel_at_t + 0.5 * target.acceleration * TICK_LENGTH - us.velocity;
+            // Derivative of position_at_dt w.r.t. t is velocity_at_dt — clean, no tick correction needed.
+            let target_vel_at_t = target.velocity_at_dt(dt_base + t);
+            let d_prime = target_vel_at_t - us.velocity;
             if d_len > 1e-6 {
                 d.dot(d_prime) / d_len - self.bullet_speed
             } else {
@@ -236,8 +242,9 @@ impl AimAt for GunAimer {
 
         if let Some(t) = crate::control::newton_solve(t0, f, df, clamp, 20, 1e-4) {
             if t >= 0.0 {
-                let tick_at_impact = current_tick() + (t / TICK_LENGTH).round() as u32;
-                let p_e = target.position_at(tick_at_impact);
+                // Use continuous-time prediction: the game uses linear interpolation between
+                // tick states for collision detection, so a bullet can hit between ticks.
+                let p_e = target.position_at_dt(dt_base + t);
                 let d = p_e - gun_pos - t * us.velocity;
                 let d_len = d.length();
                 if d_len > 0.0 {
@@ -248,20 +255,21 @@ impl AimAt for GunAimer {
                     let us_pos_next = us.position + us.velocity * TICK_LENGTH;
                     let gun_pos_next = us_pos_next + self.offset.rotate(us_heading_next);
 
+                    // dt_base_next: continuous offset from target.last_scanned to (current_tick + 1).
+                    let dt_base_next = dt_base + TICK_LENGTH;
+
                     let f_next = |t_next: f64| {
-                        let tick_at_t = (current_tick() + 1) + (t_next / TICK_LENGTH).round() as u32;
-                        let p_e = target.position_at(tick_at_t);
+                        let p_e = target.position_at_dt(dt_base_next + t_next);
                         let d_n = p_e - gun_pos_next - t_next * us.velocity;
                         d_n.length() - self.bullet_speed * t_next
                     };
 
                     let df_next = |t_next: f64| {
-                        let tick_at_t = (current_tick() + 1) + (t_next / TICK_LENGTH).round() as u32;
-                        let p_e = target.position_at(tick_at_t);
+                        let p_e = target.position_at_dt(dt_base_next + t_next);
                         let d_n = p_e - gun_pos_next - t_next * us.velocity;
                         let d_len = d_n.length();
-                        let target_vel_at_t = target.velocity_at(tick_at_t);
-                        let d_prime = target_vel_at_t + 0.5 * target.acceleration * TICK_LENGTH - us.velocity;
+                        let target_vel_at_t = target.velocity_at_dt(dt_base_next + t_next);
+                        let d_prime = target_vel_at_t - us.velocity;
                         if d_len > 1e-6 {
                             d_n.dot(d_prime) / d_len - self.bullet_speed
                         } else {
@@ -274,8 +282,8 @@ impl AimAt for GunAimer {
                         t_next_solved = t_n;
                     }
 
-                    let tick_at_impact_next = (current_tick() + 1) + (t_next_solved / TICK_LENGTH).round() as u32;
-                    let p_e_next = target.position_at(tick_at_impact_next);
+                    // Continuous-time prediction for the next-tick intercept as well.
+                    let p_e_next = target.position_at_dt(dt_base_next + t_next_solved);
                     let d_next = p_e_next - gun_pos_next - t_next_solved * us.velocity;
                     
                     let omega = if d_next.length() > 0.0 {
