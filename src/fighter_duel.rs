@@ -912,6 +912,8 @@ mod fighter_duel_test {
             last_beam_center: None,
             last_beam_center_pos: None,
             missile_scan_ticks_remaining: 0,
+            scan_boundary_points: None,
+            scan_boundary_vels: None,
         }
     }
 

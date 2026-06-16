@@ -24,6 +24,8 @@ fn test_kalman_filter() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
 
     // Check initial covariance properties
@@ -94,6 +96,8 @@ fn test_radar_clamped_tracking_width() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
 
     let next_pos_uncertainty = 100.0f64;
@@ -134,6 +138,8 @@ fn test_radar_out_of_range_retained() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
 
     let contact_far = Contact {
@@ -158,6 +164,8 @@ fn test_radar_out_of_range_retained() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
 
     // Assert is_within_range functions as expected for both distances
@@ -250,6 +258,8 @@ fn test_nearby_contact_exclusion() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
     rc.contacts.push(target.clone());
 
@@ -285,6 +295,8 @@ fn test_nearby_contact_exclusion() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
     rc.contacts.push(left_contact);
 
@@ -466,6 +478,8 @@ fn test_jamming_mode() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
     rc.contacts.push(contact);
 
@@ -516,6 +530,8 @@ fn test_missile_priority_scanning_threshold() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
     rc.contacts.push(contact);
 
@@ -585,6 +601,8 @@ fn test_advanced_beam_tracking() {
         last_beam_center: Some(0.0),
         last_beam_center_pos: Some(Vec2::new(1000.0, 0.0)),
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
     rc.contacts.push(contact_upper_bound.clone());
 
@@ -614,6 +632,8 @@ fn test_advanced_beam_tracking() {
         last_beam_center: Some(0.0),
         last_beam_center_pos: Some(Vec2::new(1000.0, 0.0)),
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
     
     let job_high_variance = rc.generate_tracking_scan(&contact_high_variance, current_tick()).unwrap();
@@ -692,6 +712,8 @@ fn test_tracking_beam_exclusion() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
     rc.contacts.push(contact_target);
 
@@ -718,6 +740,8 @@ fn test_tracking_beam_exclusion() {
         last_beam_center: None,
         last_beam_center_pos: None,
         missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
     };
     rc.contacts.push(contact_other);
 
@@ -749,4 +773,159 @@ fn test_tracking_beam_exclusion() {
     // so no match should be found.
     let res_with_slice = rc.find_best_matching_contact(&scan_hit, scan_ci_radius, slice, 0, 1.0);
     assert_eq!(res_with_slice, None);
+}
+
+#[test]
+fn test_scan_boundary() {
+    let mut contact = Contact {
+        id: 1,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(100.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
+        rssi: 0.0,
+        snr: 30.0,
+        pos_uncertainty: 10.0,
+        vel_uncertainty: 2.0,
+        radar_locked: true,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(10.0, 2.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(10.0, 2.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
+    };
+
+    let slice = ScanSlice {
+        angle: 0.0,
+        width: 0.1,
+        min_distance: 80.0,
+        max_distance: 120.0,
+    };
+
+    contact.update_scan_boundary(slice);
+
+    assert!(contact.scan_boundary_points.is_some());
+    assert!(contact.scan_boundary_vels.is_some());
+
+    let pts_before = contact.scan_boundary_points.unwrap();
+    let vels_before = contact.scan_boundary_vels.unwrap();
+
+    // The geometric center of the corners
+    let center = (pts_before[0] + pts_before[1] + pts_before[2] + pts_before[3]) / 4.0;
+    
+    // Check that velocity vector has components directed away from center
+    for i in 0..4 {
+        let diff = pts_before[i] - center;
+        let dir = diff.normalize();
+        let expected_v = contact.current_velocity() + dir * (contact.ci_mult() * contact.vel_uncertainty * 2.0f64.sqrt());
+        assert!((vels_before[i] - expected_v).length() < 1e-6);
+    }
+
+    // Predict
+    let dt = 1.0;
+    contact.predict_scan_boundary(dt);
+
+    let pts_after = contact.scan_boundary_points.unwrap();
+    let vels_after = contact.scan_boundary_vels.unwrap();
+
+    let stats = contact.class.default_stats();
+    let mut max_acc = stats
+        .max_forward_acceleration
+        .max(stats.max_backward_acceleration)
+        .max(stats.max_lateral_acceleration);
+    if contact.class == Class::Fighter || contact.class == Class::Missile {
+        max_acc += 100.0;
+    }
+
+    for i in 0..4 {
+        let diff = pts_before[i] - center;
+        let dir = diff.normalize();
+        let expected_v_after = vels_before[i] + dir * (max_acc * 2.0f64.sqrt() * dt);
+        assert!((vels_after[i] - expected_v_after).length() < 1e-6);
+
+        let expected_p_after = pts_before[i] + expected_v_after * dt;
+        assert!((pts_after[i] - expected_p_after).length() < 1e-6);
+    }
+
+    // Verify generate_tracking_scan constraints with the scan boundary
+    let mut rc = RadarController::new();
+    let mut contact2 = Contact {
+        id: 10,
+        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        last_measurement_tick: 0,
+        rssi: 0.0,
+        snr: 30.0,
+        pos_uncertainty: 20.0,
+        vel_uncertainty: 5.0,
+        radar_locked: true,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(20.0, 5.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(20.0, 5.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
+    };
+
+    // Initialize scan boundary
+    let slice2 = ScanSlice {
+        angle: 0.0,
+        width: 0.05,
+        min_distance: 950.0,
+        max_distance: 1050.0,
+    };
+    contact2.update_scan_boundary(slice2);
+
+    rc.contacts.push(contact2.clone());
+    let job = rc.generate_tracking_scan(&contact2, 0).expect("Job should be generated");
+
+    // The job min and max distances must be constrained by the boundary points
+    let next_our_pos = position() + velocity() * TICK_LENGTH;
+    let pts = contact2.scan_boundary_points.unwrap();
+    let vels = contact2.scan_boundary_vels.unwrap();
+    let mut min_pt_dist = f64::MAX;
+    let mut max_pt_dist = -f64::MAX;
+    let mut min_pt_rel_angle = f64::MAX;
+    let mut max_pt_rel_angle = -f64::MAX;
+    let target_angle = (contact2.position_at(1) - next_our_pos).angle();
+
+    for i in 0..4 {
+        let p_proj = pts[i] + vels[i] * TICK_LENGTH;
+        let d = next_our_pos.distance(p_proj);
+        min_pt_dist = min_pt_dist.min(d);
+        max_pt_dist = max_pt_dist.max(d);
+
+        let pt_angle = (p_proj - next_our_pos).angle();
+        let rel_angle = normalize_angle(pt_angle - target_angle);
+        min_pt_rel_angle = min_pt_rel_angle.min(rel_angle);
+        max_pt_rel_angle = max_pt_rel_angle.max(rel_angle);
+    }
+
+    assert!(job.min_distance >= min_pt_dist - 1e-6);
+    assert!(job.max_distance <= max_pt_dist + 1e-6);
+
+    // The job angle and width bounds must not extend beyond the leftmost/rightmost points (subject to min beam angle 0.005)
+    let job_left_rel = normalize_angle((job.angle + job.width / 2.0) - target_angle);
+    let job_right_rel = normalize_angle((job.angle - job.width / 2.0) - target_angle);
+
+    if job.width > 0.005 + 1e-9 {
+        assert!(job_left_rel <= max_pt_rel_angle + 1e-6);
+        assert!(job_right_rel >= min_pt_rel_angle - 1e-6);
+    }
 }
