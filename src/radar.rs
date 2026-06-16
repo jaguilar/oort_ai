@@ -857,13 +857,27 @@ impl RadarController {
         }
     }
 
+        fn num_radars(&self) -> usize {
+        if class() == Class::Cruiser { 2 } else { 1 }
+    }
+
     pub fn update(&mut self) {
         let current_t = current_tick();
+
+        self.predict(current_t);
+        let hit_seen_this_tick = self.process_scans(current_t);
+        self.cleanup(current_t);
+        self.generate_new_scans(current_t, hit_seen_this_tick);
+    }
+
+    fn predict(&mut self, current_t: u32) {
         for contact in &mut self.contacts {
             contact.predict(current_t);
         }
-        let num_radars = if class() == Class::Cruiser { 2 } else { 1 };
+    }
 
+    fn process_scans(&mut self, current_t: u32) -> bool {
+        let num_radars = self.num_radars();
         let mut hit_seen_this_tick = false;
 
         // 1. Process scan results from previous tick depending on radar_states
@@ -1248,6 +1262,11 @@ impl RadarController {
             }
         }
 
+
+        hit_seen_this_tick
+    }
+
+    fn cleanup(&mut self, current_t: u32) {
         // Update unscanned_in_range_ticks
         for contact in &mut self.contacts {
             if contact.last_measurement_tick == current_t {
@@ -1301,6 +1320,10 @@ impl RadarController {
             keep
         });
 
+    }
+
+    fn generate_new_scans(&mut self, current_t: u32, hit_seen_this_tick: bool) {
+        let num_radars = self.num_radars();
         // 4. Generate jobs for next tick
         let tracking_jobs: Vec<RadarJob> = self.tracking_jobs().collect();
 
