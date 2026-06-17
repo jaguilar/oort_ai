@@ -219,21 +219,21 @@ impl Cruiser {
                 let t0 = TargetTelemetry {
                     position: clusters[0][0].current_position(),
                     velocity: clusters[0][0].current_velocity(),
-                    rssi: clusters[0][0].rssi as f32,
+                    rssi: 0.0,
                     class: clusters[0][0].class,
                     tick: current_tick as u8,
                 };
                 let t1 = TargetTelemetry {
                     position: clusters[1][0].current_position(),
                     velocity: clusters[1][0].current_velocity(),
-                    rssi: clusters[1][0].rssi as f32,
+                    rssi: 0.0,
                     class: clusters[1][0].class,
                     tick: current_tick as u8,
                 };
                 let t2 = TargetTelemetry {
                     position: clusters[2][0].current_position(),
                     velocity: clusters[2][0].current_velocity(),
-                    rssi: clusters[2][0].rssi as f32,
+                    rssi: 0.0,
                     class: clusters[2][0].class,
                     tick: current_tick as u8,
                 };

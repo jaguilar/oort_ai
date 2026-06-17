@@ -103,7 +103,7 @@ impl MissileRadioSender {
                 let telemetry = TargetTelemetry {
                     position: contact.current_position(),
                     velocity: contact.current_velocity(),
-                    rssi: contact.rssi as f32,
+                    rssi: 0.0,
                     class: contact.class,
                     tick: current_tick() as u8,
                 };

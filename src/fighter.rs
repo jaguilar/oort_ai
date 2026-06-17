@@ -239,7 +239,7 @@ impl Fighter {
             // --- Dedicated Missile Telemetry and Firing ---
             let mut current_missile_target = None;
             if let Some(c) = contacts.iter().find(|c| c.class == Class::Fighter) {
-                current_missile_target = Some((c.id, c.current_position(), c.current_velocity(), c.rssi as f32, c.class));
+                current_missile_target = Some((c.id, c.current_position(), c.current_velocity(), 0.0f32, c.class));
             } else if let Some(last_pos) = self.fighter_last_known_target_pos {
                 let last_vel = self.fighter_last_known_target_vel.unwrap_or(Vec2::new(0.0, 0.0));
                 let tid = self.fighter_target_id.unwrap_or(0);

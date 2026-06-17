@@ -4,13 +4,16 @@ use super::*;
 fn test_kalman_filter() {
     let mut contact = Contact {
         id: 0,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: 0.0,
-        snr: 30.0,
         pos_uncertainty: 20.0,
         vel_uncertainty: 10.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -69,20 +72,27 @@ fn test_kalman_filter() {
 
     // Verify that the final uncertainty is smaller than the initial, showing integration
     let final_pos_unc = contact.pos_uncertainty_at(t);
-    assert!(final_pos_unc < 20.0, "Position uncertainty did not decrease! final={}", final_pos_unc);
+    assert!(
+        final_pos_unc < 20.0,
+        "Position uncertainty did not decrease! final={}",
+        final_pos_unc
+    );
 }
 
 #[test]
 fn test_radar_clamped_tracking_width() {
     let contact = Contact {
         id: 0,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: 0.0,
-        snr: 30.0,
         pos_uncertainty: 100.0,
         vel_uncertainty: 10.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -118,13 +128,16 @@ fn test_radar_clamped_tracking_width() {
 fn test_radar_out_of_range_retained() {
     let contact_close = Contact {
         id: 1,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 1000.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(0.0, 1000.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: 0.0,
-        snr: 30.0,
         pos_uncertainty: 10.0,
         vel_uncertainty: 5.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -144,13 +157,16 @@ fn test_radar_out_of_range_retained() {
 
     let contact_far = Contact {
         id: 2,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(0.0, 200000.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(0.0, 200000.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: 0.0,
-        snr: 30.0,
         pos_uncertainty: 10.0,
         vel_uncertainty: 5.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -188,7 +204,7 @@ fn test_add_radio_ping() {
     // 1. Adding a new ping should add it directly and return its ID
     let id1 = rc.add_radio_ping(telemetry1);
     assert!(id1 > 0);
-    
+
     // Check that the contact list has the new contact and it is NOT provisional
     let contact1 = rc.get_contact(id1).expect("Contact should exist");
     assert_eq!(contact1.id, id1);
@@ -238,13 +254,16 @@ fn test_nearby_contact_exclusion() {
     // Target contact at (1000.0, 0.0)
     let target = Contact {
         id: 1,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(1000.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: 0.0,
-        snr: 30.0,
         pos_uncertainty: 10.0,
         vel_uncertainty: 5.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -264,24 +283,37 @@ fn test_nearby_contact_exclusion() {
     rc.contacts.push(target.clone());
 
     // 1. First: no nearby contacts. The tracking job should be the initial job.
-    let job1 = rc.generate_tracking_scan(&target, 0).expect("Job should be generated");
+    let job1 = rc
+        .generate_tracking_scan(&target, 0)
+        .expect("Job should be generated");
     assert_eq!(job1.angle, 0.0);
     // By default target is at 1000m.
     // Min distance = (1000.0 - 32.9) = 967.1. Max distance = 1000.0 + 32.9 = 1032.9.
-    assert!((job1.min_distance - 967.1).abs() < 0.1, "min_distance was {}", job1.min_distance);
-    assert!((job1.max_distance - 1032.9).abs() < 0.1, "max_distance was {}", job1.max_distance);
+    assert!(
+        (job1.min_distance - 967.1).abs() < 0.1,
+        "min_distance was {}",
+        job1.min_distance
+    );
+    assert!(
+        (job1.max_distance - 1032.9).abs() < 0.1,
+        "max_distance was {}",
+        job1.max_distance
+    );
 
     // 2. Add a confusing contact to the left (counter-clockwise, positive angle)
     // Let's place it at (1000.0, 30.0), so angle is approx 0.03 rad.
     let left_contact = Contact {
         id: 2,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 30.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(1000.0, 30.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: 0.0,
-        snr: 30.0,
         pos_uncertainty: 1.0,
         vel_uncertainty: 1.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -300,9 +332,15 @@ fn test_nearby_contact_exclusion() {
     };
     rc.contacts.push(left_contact);
 
-    let job2 = rc.generate_tracking_scan(&target, 0).expect("Job should be generated");
+    let job2 = rc
+        .generate_tracking_scan(&target, 0)
+        .expect("Job should be generated");
     // Because of the left contact, the beam should shift clockwise (to the right, i.e. negative angle).
-    assert!(job2.angle < 0.0, "Beam should shift to the right, angle = {}", job2.angle);
+    assert!(
+        job2.angle < 0.0,
+        "Beam should shift to the right, angle = {}",
+        job2.angle
+    );
 }
 
 #[test]
@@ -324,22 +362,28 @@ fn test_radar_pings_reliable_range() {
     };
 
     // 1. Scan with slice_width = 0.6: should NOT add a new contact (returns 0, contacts.len() is 0)
-    let id1 = rc.process_scan_hit(scan_hit.clone(), Some(ScanSlice {
-        angle: 0.0,
-        width: 0.6,
-        min_distance: 0.0,
-        max_distance: 100000.0,
-    }));
+    let id1 = rc.process_scan_hit(
+        scan_hit.clone(),
+        Some(ScanSlice {
+            angle: 0.0,
+            width: 0.6,
+            min_distance: 0.0,
+            max_distance: 100000.0,
+        }),
+    );
     assert_eq!(id1, 0);
     assert!(rc.contacts.is_empty());
 
     // 2. Scan with slice_width = 0.05: should successfully add a new contact (returns id > 0, contacts.len() is 1)
-    let id2 = rc.process_scan_hit(scan_hit.clone(), Some(ScanSlice {
-        angle: 0.0,
-        width: 0.05,
-        min_distance: 0.0,
-        max_distance: 100000.0,
-    }));
+    let id2 = rc.process_scan_hit(
+        scan_hit.clone(),
+        Some(ScanSlice {
+            angle: 0.0,
+            width: 0.05,
+            min_distance: 0.0,
+            max_distance: 100000.0,
+        }),
+    );
     assert!(id2 > 0);
     assert_eq!(rc.contacts.len(), 1);
     assert_eq!(rc.contacts[0].id, id2);
@@ -429,7 +473,7 @@ fn test_missile_priority_scanning_initialization() {
 
     let id = rc.process_scan_hit(m_incoming, None);
     assert!(id > 0);
-    
+
     let contact = rc.get_contact(id).expect("Contact should exist");
     assert_eq!(contact.class, Class::Missile);
     assert_eq!(contact.prioritize_scan, true);
@@ -458,13 +502,16 @@ fn test_jamming_mode() {
 
     let contact = Contact {
         id: 42,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), current_tick()),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(1000.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            current_tick(),
+        ),
         last_measurement_tick: current_tick(),
-        rssi: -50.0,
-        snr: 40.0,
         pos_uncertainty: 10.0,
         vel_uncertainty: 5.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -510,13 +557,16 @@ fn test_missile_priority_scanning_threshold() {
     // Create a prioritized contact moving towards us (velocity -10m/s) so it is not pruned
     let contact = Contact {
         id: 100,
-        kinematic: KinematicState::new(Class::Missile, Vec2::new(1000.0, 0.0), Vec2::new(-10.0, 0.0), Vec2::new(0.0, 0.0), current_tick().wrapping_sub(1)),
+        kinematic: KinematicState::new(
+            Class::Missile,
+            Vec2::new(1000.0, 0.0),
+            Vec2::new(-10.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            current_tick().wrapping_sub(1),
+        ),
         last_measurement_tick: current_tick().wrapping_sub(1),
-        rssi: -50.0,
-        snr: 30.0,
         pos_uncertainty: 10.0,
         vel_uncertainty: 5.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -573,72 +623,6 @@ fn test_missile_priority_scanning_threshold() {
     assert_eq!(updated_contact_2.prioritize_scan, false);
 }
 
-#[test]
-fn test_advanced_beam_tracking() {
-    let mut rc = RadarController::new();
-    rc.set_tracking_width(0.05);
-
-    // 1. Test upper-bounding of the beam width when last scan was within 0.25s
-    let contact_upper_bound = Contact {
-        id: 1,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), current_tick().wrapping_sub(1)),
-        last_measurement_tick: current_tick().wrapping_sub(1),
-        rssi: -50.0,
-        snr: 40.0,
-        pos_uncertainty: 1.0,
-        vel_uncertainty: 1.0,
-        radar_locked: true,
-        provisional: false,
-        tracking_retry_count: 0,
-        confirmation_attempts: 0,
-        unscanned_in_range_ticks: 0,
-        p_cov_x: Contact::initial_cov(1.0, 1.0, Class::Fighter),
-        p_cov_y: Contact::initial_cov(1.0, 1.0, Class::Fighter),
-        prioritize_scan: false,
-        prev_scan_pos_uncertainty: None,
-        low_improvement_consecutive_scans: 0,
-        last_beam_width: Some(0.02),
-        last_beam_center: Some(0.0),
-        last_beam_center_pos: Some(Vec2::new(1000.0, 0.0)),
-        missile_scan_ticks_remaining: 0,
-        scan_boundary_points: None,
-        scan_boundary_vels: None,
-    };
-    rc.contacts.push(contact_upper_bound.clone());
-
-    let job_upper_bound = rc.generate_tracking_scan(&contact_upper_bound, current_tick()).unwrap();
-    assert!(job_upper_bound.width <= 0.02, "Width was {}, expected <= 0.02", job_upper_bound.width);
-
-    // 2. Test high-variance centering logic
-    let contact_high_variance = Contact {
-        id: 2,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 50.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), current_tick().wrapping_sub(1)),
-        last_measurement_tick: current_tick().wrapping_sub(1),
-        rssi: -50.0,
-        snr: 40.0,
-        pos_uncertainty: 10.0,
-        vel_uncertainty: 1.0,
-        radar_locked: true,
-        provisional: false,
-        tracking_retry_count: 0,
-        confirmation_attempts: 0,
-        unscanned_in_range_ticks: 0,
-        p_cov_x: Contact::initial_cov(10.0, 1.0, Class::Fighter),
-        p_cov_y: Contact::initial_cov(10.0, 1.0, Class::Fighter),
-        prioritize_scan: false,
-        prev_scan_pos_uncertainty: None,
-        low_improvement_consecutive_scans: 0,
-        last_beam_width: Some(0.02),
-        last_beam_center: Some(0.0),
-        last_beam_center_pos: Some(Vec2::new(1000.0, 0.0)),
-        missile_scan_ticks_remaining: 0,
-        scan_boundary_points: None,
-        scan_boundary_vels: None,
-    };
-    
-    let job_high_variance = rc.generate_tracking_scan(&contact_high_variance, current_tick()).unwrap();
-    assert!(job_high_variance.angle.abs() < 1e-5, "Angle was {}, expected 0.0", job_high_variance.angle);
-}
 
 #[test]
 fn test_new_missile_prioritization() {
@@ -680,7 +664,7 @@ fn test_new_missile_prioritization() {
         snr: 25.0,
     };
     rc.process_scan_hit(scan_hit2, None);
-    
+
     let contact = rc.get_contact(id).unwrap();
     assert_eq!(contact.missile_scan_ticks_remaining, 3);
 }
@@ -692,13 +676,16 @@ fn test_tracking_beam_exclusion() {
     // Target contact 42 (active target)
     let contact_target = Contact {
         id: 42,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(1000.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: -50.0,
-        snr: 40.0,
         pos_uncertainty: 1.0,
         vel_uncertainty: 1.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -720,13 +707,16 @@ fn test_tracking_beam_exclusion() {
     // Contact 43 (outside the beam, but close to where the hit will be simulated)
     let contact_other = Contact {
         id: 43,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 200.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(1000.0, 200.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: -50.0,
-        snr: 40.0,
         pos_uncertainty: 10.0,
         vel_uncertainty: 1.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -779,13 +769,16 @@ fn test_tracking_beam_exclusion() {
 fn test_scan_boundary() {
     let mut contact = Contact {
         id: 1,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(100.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(100.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: 0.0,
-        snr: 30.0,
         pos_uncertainty: 10.0,
         vel_uncertainty: 2.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -820,12 +813,13 @@ fn test_scan_boundary() {
 
     // The geometric center of the corners
     let center = (pts_before[0] + pts_before[1] + pts_before[2] + pts_before[3]) / 4.0;
-    
+
     // Check that velocity vector has components directed away from center
     for i in 0..4 {
         let diff = pts_before[i] - center;
         let dir = diff.normalize();
-        let expected_v = contact.current_velocity() + dir * (contact.ci_mult() * contact.vel_uncertainty * 2.0f64.sqrt());
+        let expected_v = contact.current_velocity()
+            + dir * (contact.ci_mult() * contact.vel_uncertainty * 2.0f64.sqrt());
         assert!((vels_before[i] - expected_v).length() < 1e-6);
     }
 
@@ -859,13 +853,16 @@ fn test_scan_boundary() {
     let mut rc = RadarController::new();
     let mut contact2 = Contact {
         id: 10,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(1000.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: 0.0,
-        snr: 30.0,
         pos_uncertainty: 20.0,
         vel_uncertainty: 5.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -893,7 +890,9 @@ fn test_scan_boundary() {
     contact2.update_scan_boundary(slice2);
 
     rc.contacts.push(contact2.clone());
-    let job = rc.generate_tracking_scan(&contact2, 0).expect("Job should be generated");
+    let job = rc
+        .generate_tracking_scan(&contact2, 0)
+        .expect("Job should be generated");
 
     // The job min and max distances must be constrained by the boundary points
     let next_our_pos = position() + velocity() * TICK_LENGTH;
@@ -931,6 +930,67 @@ fn test_scan_boundary() {
 }
 
 #[test]
+fn test_expand_scan_boundary() {
+    let mut contact = Contact {
+        id: 1,
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(100.0, 0.0),
+            Vec2::new(10.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
+        last_measurement_tick: 0,
+        pos_uncertainty: 10.0,
+        vel_uncertainty: 2.0,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(10.0, 2.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(10.0, 2.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: None,
+        scan_boundary_vels: None,
+    };
+
+    let slice = ScanSlice {
+        angle: 0.0,
+        width: 0.1,
+        min_distance: 80.0,
+        max_distance: 120.0,
+    };
+
+    contact.update_scan_boundary(slice);
+
+    assert!(contact.scan_boundary_points.is_some());
+    let pts_before = contact.scan_boundary_points.unwrap();
+    let center_before = (pts_before[0] + pts_before[1] + pts_before[2] + pts_before[3]) / 4.0;
+
+    contact.expand_scan_boundary(0.1);
+
+    let pts_after = contact.scan_boundary_points.unwrap();
+    let center_after = (pts_after[0] + pts_after[1] + pts_after[2] + pts_after[3]) / 4.0;
+
+    // Center should remain unchanged
+    assert!((center_after - center_before).length() < 1e-6);
+
+    // Each point should be moved 10% further from the center
+    for i in 0..4 {
+        let dist_before = pts_before[i].distance(center_before);
+        let dist_after = pts_after[i].distance(center_after);
+        assert!((dist_after - dist_before * 1.1).abs() < 1e-6);
+    }
+}
+
+
+#[test]
 fn test_scan_cone_filtering_in_association() {
     let mut rc = RadarController::new();
 
@@ -939,13 +999,16 @@ fn test_scan_cone_filtering_in_association() {
 
     let contact = Contact {
         id: 77,
-        kinematic: KinematicState::new(Class::Fighter, contact_pos, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 0),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            contact_pos,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
         last_measurement_tick: 0,
-        rssi: -50.0,
-        snr: 40.0,
         pos_uncertainty: 200.0, // Large uncertainty so gate overlaps everything
         vel_uncertainty: 1.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -986,8 +1049,12 @@ fn test_scan_cone_filtering_in_association() {
         min_distance: 900.0,
         max_distance: 1100.0,
     });
-    let res_no_intersect = rc.find_best_matching_contact(&scan_hit, scan_ci_radius, slice_no_intersect, 0, 1.0);
-    assert_eq!(res_no_intersect, None, "Contact should be filtered out because scan cone does not intersect radar beam");
+    let res_no_intersect =
+        rc.find_best_matching_contact(&scan_hit, scan_ci_radius, slice_no_intersect, 0, 1.0);
+    assert_eq!(
+        res_no_intersect, None,
+        "Contact should be filtered out because scan cone does not intersect radar beam"
+    );
 
     // 2. Slice that DOES intersect the scan cone: angle = 0.15, width = 0.1
     let slice_intersect = Some(ScanSlice {
@@ -996,8 +1063,13 @@ fn test_scan_cone_filtering_in_association() {
         min_distance: 900.0,
         max_distance: 1100.0,
     });
-    let res_intersect = rc.find_best_matching_contact(&scan_hit, scan_ci_radius, slice_intersect, 0, 1.0);
-    assert_eq!(res_intersect.map(|(id, _)| id), Some(77), "Contact should match because scan cone intersects radar beam");
+    let res_intersect =
+        rc.find_best_matching_contact(&scan_hit, scan_ci_radius, slice_intersect, 0, 1.0);
+    assert_eq!(
+        res_intersect.map(|(id, _)| id),
+        Some(77),
+        "Contact should match because scan cone intersects radar beam"
+    );
 }
 
 #[test]
@@ -1006,13 +1078,16 @@ fn test_custom_tracking_frequency() {
 
     let mut contact = Contact {
         id: 101,
-        kinematic: KinematicState::new(Class::Fighter, Vec2::new(1000.0, 0.0), Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), current_tick()),
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(1000.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            current_tick(),
+        ),
         last_measurement_tick: current_tick(),
-        rssi: -50.0,
-        snr: 40.0,
         pos_uncertainty: 10.0,
         vel_uncertainty: 1.0,
-        radar_locked: true,
         provisional: false,
         tracking_retry_count: 0,
         confirmation_attempts: 0,
@@ -1036,25 +1111,139 @@ fn test_custom_tracking_frequency() {
     contact.last_measurement_tick = current_tick().wrapping_sub(11);
     rc.contacts = vec![contact.clone()];
     let jobs: Vec<_> = rc.tracking_jobs().collect();
-    assert!(jobs.is_empty(), "Should not track target if interval has not elapsed (11 ticks)");
+    assert!(
+        jobs.is_empty(),
+        "Should not track target if interval has not elapsed (11 ticks)"
+    );
 
     // Scenario B: 12 ticks elapsed (exactly 12) -> should track
     contact.last_measurement_tick = current_tick().wrapping_sub(12);
     rc.contacts = vec![contact.clone()];
     let jobs: Vec<_> = rc.tracking_jobs().collect();
-    assert_eq!(jobs.len(), 1, "Should track target if interval has elapsed (12 ticks)");
+    assert_eq!(
+        jobs.len(),
+        1,
+        "Should track target if interval has elapsed (12 ticks)"
+    );
 
     // Scenario C: Custom frequency of 0.05s = 3 ticks
     rc.priority_target_frequencies = vec![(101, 0.05)];
     contact.last_measurement_tick = current_tick().wrapping_sub(2);
     rc.contacts = vec![contact.clone()];
     let jobs: Vec<_> = rc.tracking_jobs().collect();
-    assert!(jobs.is_empty(), "Should not track target if custom interval has not elapsed (2 ticks)");
+    assert!(
+        jobs.is_empty(),
+        "Should not track target if custom interval has not elapsed (2 ticks)"
+    );
 
     contact.last_measurement_tick = current_tick().wrapping_sub(3);
     rc.contacts = vec![contact.clone()];
     let jobs: Vec<_> = rc.tracking_jobs().collect();
-    assert_eq!(jobs.len(), 1, "Should track target if custom interval has elapsed (3 ticks)");
+    assert_eq!(
+        jobs.len(),
+        1,
+        "Should track target if custom interval has elapsed (3 ticks)"
+    );
 }
 
+#[test]
+fn test_ambiguous_scan_prevention() {
+    let mut rc = RadarController::new();
+    let current_t = current_tick();
+
+    // Create contact 1 (distance ~1000m)
+    let c1_pos = Vec2::new(1000.0, 0.0);
+    let contact1 = Contact {
+        id: 1,
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            c1_pos,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            current_t,
+        ),
+        last_measurement_tick: current_t,
+        pos_uncertainty: 10.0,
+        vel_uncertainty: 1.0,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(10.0, 1.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(10.0, 1.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: Some([
+            c1_pos + Vec2::new(-10.0, -10.0),
+            c1_pos + Vec2::new(-10.0, 10.0),
+            c1_pos + Vec2::new(10.0, -10.0),
+            c1_pos + Vec2::new(10.0, 10.0),
+        ]),
+        scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+    };
+
+    // Create contact 2 (distance ~2000m, same line of sight)
+    let c2_pos = Vec2::new(2000.0, 0.0);
+    let contact2 = Contact {
+        id: 2,
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            c2_pos,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            current_t,
+        ),
+        last_measurement_tick: current_t,
+        pos_uncertainty: 10.0,
+        vel_uncertainty: 1.0,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(10.0, 1.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(10.0, 1.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: Some([
+            c2_pos + Vec2::new(-10.0, -10.0),
+            c2_pos + Vec2::new(-10.0, 10.0),
+            c2_pos + Vec2::new(10.0, -10.0),
+            c2_pos + Vec2::new(10.0, 10.0),
+        ]),
+        scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+    };
+
+    rc.contacts.push(contact1);
+    rc.contacts.push(contact2);
+
+    let mut slice_gen = DefaultScanSliceGenerator::new(0.6, 10000.0);
+    slice_gen.last_scan_heading = Some(-0.3);
+
+    // 1st call: should avoid contact 1 (closest), setting max range to its nearest point.
+    let slice1 = slice_gen.next_slice(&rc.contacts);
+    assert!(slice1.max_distance < 1050.0);
+    assert_eq!(slice_gen.avoided_contact_id, Some(1));
+
+    // 2nd call: should start after contact 1's furthest point, and avoid contact 2.
+    let slice2 = slice_gen.next_slice(&rc.contacts);
+    assert!(slice2.min_distance > 990.0);
+    assert!(slice2.max_distance < 2050.0);
+    assert_eq!(slice_gen.avoided_contact_id, Some(2));
+
+    // 3rd call: should start after contact 2's furthest point, and scan up to 10000.0.
+    let slice3 = slice_gen.next_slice(&rc.contacts);
+    assert!(slice3.min_distance > 1990.0);
+    assert_eq!(slice3.max_distance, 10000.0);
+    assert_eq!(slice_gen.avoided_contact_id, None);
+}
 

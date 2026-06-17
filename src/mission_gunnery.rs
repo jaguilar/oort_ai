@@ -51,7 +51,7 @@ impl GunneryScanSliceGenerator {
 }
 
 impl ScanSliceGenerator for GunneryScanSliceGenerator {
-    fn next_slice(&mut self, _target: Option<&Contact>) -> ScanSlice {
+    fn next_slice(&mut self, _contacts: &[Contact]) -> ScanSlice {
         let current_t = current_tick();
         let mut hit = false;
         let mut hit_distance = 0.0;

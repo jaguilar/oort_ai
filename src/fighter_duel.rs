@@ -7,70 +7,8 @@ use std::rc::Rc;
 const SALVO_SIZE: usize = 2;
 use crate::aim::FireControl;
 use crate::physics::KinematicState;
-use crate::radar::{
-    Contact, DefaultScanSliceGenerator, RadarController, ScanSlice, ScanSliceGenerator,
-};
+use crate::radar::{Contact, DefaultScanSliceGenerator, RadarController};
 use crate::radio::{RadioManager, SecureRadio};
-
-pub struct BiasedScanSliceGenerator {
-    pub default_generator: DefaultScanSliceGenerator,
-    pub biased_scan_width: f64,
-    pub slice_index: usize,
-    pub target_pos: Rc<RefCell<Option<Vec2>>>,
-}
-
-impl BiasedScanSliceGenerator {
-    pub fn new(
-        default_generator: DefaultScanSliceGenerator,
-        biased_scan_width: f64,
-        target_pos: Rc<RefCell<Option<Vec2>>>,
-    ) -> Self {
-        Self {
-            default_generator,
-            biased_scan_width,
-            slice_index: 0,
-            target_pos,
-        }
-    }
-}
-
-impl ScanSliceGenerator for BiasedScanSliceGenerator {
-    fn notify_hit(&mut self) {
-        self.default_generator.notify_hit();
-    }
-
-    fn notify_non_missile_contact(&mut self, has: bool) {
-        self.default_generator.notify_non_missile_contact(has);
-    }
-
-    fn next_slice(&mut self, target: Option<&Contact>) -> ScanSlice {
-        let target_pos = *self.target_pos.borrow();
-        if let Some(pos) = target_pos {
-            let num_slices = 6 * (TAU / self.default_generator.base_search_width).round() as usize;
-            let slice_width = self.biased_scan_width / num_slices as f64;
-
-            if self.slice_index >= num_slices {
-                self.slice_index = 0;
-            }
-
-            let target_angle = (pos - position()).angle();
-            let start_angle = target_angle - self.biased_scan_width / 2.0;
-            let angle = start_angle + (self.slice_index as f64 + 0.5) * slice_width;
-
-            self.slice_index += 1;
-
-            ScanSlice {
-                angle,
-                width: slice_width,
-                min_distance: 0.0,
-                max_distance: self.default_generator.max_distance,
-            }
-        } else {
-            self.slice_index = 0;
-            self.default_generator.next_slice(target)
-        }
-    }
-}
 
 fn can_missile_intercept(missile: &KinematicState, target: &KinematicState) -> bool {
     let t_now = current_tick();
@@ -214,11 +152,10 @@ impl Ship {
     pub fn new() -> Ship {
         let mut rc = RadarController::new();
         let target_pos = Rc::new(RefCell::new(None));
-        rc.slice_generator = Box::new(BiasedScanSliceGenerator::new(
-            DefaultScanSliceGenerator::new(0.6, 20000.0),
-            60.0f64.to_radians(),
-            target_pos.clone(),
-        ));
+        let mut generator = DefaultScanSliceGenerator::new(0.6, 20000.0);
+        generator.target_pos = Some(target_pos.clone());
+        generator.biased_scan_width = 60.0f64.to_radians();
+        rc.slice_generator = Box::new(generator);
 
         let radio_manager = Rc::new(RefCell::new(RadioManager::new()));
         let missile_radio = SecureRadio::new(1337, 0, radio_manager.clone());
@@ -286,7 +223,12 @@ impl Ship {
                 Vec2::new(0.0, 0.0),
                 current_tick(),
             );
-            for c in self.radar_controller.contacts().iter().filter(|c| c.class == Class::Missile) {
+            for c in self
+                .radar_controller
+                .contacts()
+                .iter()
+                .filter(|c| c.class == Class::Missile)
+            {
                 if Some(c.id) == self.pd_target_id {
                     continue;
                 }
@@ -824,12 +766,8 @@ impl Ship {
             // --- Dedicated Missile Telemetry and Firing ---
             let mut current_missile_target = None;
             if let Some(c) = contacts.iter().find(|c| c.class == Class::Fighter) {
-                current_missile_target = Some((
-                    c.current_position(),
-                    c.current_velocity(),
-                    c.rssi as f32,
-                    c.class,
-                ));
+                current_missile_target =
+                    Some((c.current_position(), c.current_velocity(), 0.0f32, c.class));
             } else if let Some(last_pos) = self.fighter_last_known_target_pos {
                 let last_vel = self
                     .fighter_last_known_target_vel
@@ -889,25 +827,6 @@ impl Ship {
         let Some((c, _, _, _)) = best_pd_missile else {
             return;
         };
-        debug!(
-            "PD Aim Inputs (Us) - pos=[{:.1}, {:.1}] vel=[{:.1}, {:.1}] heading={:.3} omega={:.3}",
-            us_kinematic.position.x,
-            us_kinematic.position.y,
-            us_kinematic.velocity.x,
-            us_kinematic.velocity.y,
-            us_kinematic.heading.unwrap_or(0.0),
-            us_kinematic.angular_velocity.unwrap_or(0.0)
-        );
-        debug!(
-            "PD Aim Inputs (Missile #{}) - pos=[{:.1}, {:.1}] vel=[{:.1}, {:.1}] acc=[{:.1}, {:.1}]",
-            c.id,
-            c.kinematic.position.x,
-            c.kinematic.position.y,
-            c.kinematic.velocity.x,
-            c.kinematic.velocity.y,
-            c.kinematic.acceleration.x,
-            c.kinematic.acceleration.y
-        );
     }
 
     fn compute_desired_heading(
@@ -971,11 +890,8 @@ mod fighter_duel_test {
             id,
             kinematic: KinematicState::new(Class::Missile, pos, vel, Vec2::new(0.0, 0.0), 0),
             last_measurement_tick: 0,
-            rssi: 0.0,
-            snr: 30.0,
             pos_uncertainty: 0.0,
             vel_uncertainty: 0.0,
-            radar_locked: true,
             provisional: false,
             tracking_retry_count: 0,
             confirmation_attempts: 0,
