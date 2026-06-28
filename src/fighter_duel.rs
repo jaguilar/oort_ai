@@ -907,6 +907,7 @@ mod fighter_duel_test {
             missile_scan_ticks_remaining: 0,
             scan_boundary_points: None,
             scan_boundary_vels: None,
+            discovery_beam_width: 0.6,
         }
     }
 

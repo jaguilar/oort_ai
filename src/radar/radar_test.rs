@@ -29,6 +29,7 @@ fn test_kalman_filter() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
 
     // Check initial covariance properties
@@ -108,6 +109,7 @@ fn test_radar_clamped_tracking_width() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
 
     let next_pos_uncertainty = 100.0f64;
@@ -153,6 +155,7 @@ fn test_radar_out_of_range_retained() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
 
     let contact_far = Contact {
@@ -182,6 +185,7 @@ fn test_radar_out_of_range_retained() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
 
     // Assert is_within_range functions as expected for both distances
@@ -279,6 +283,7 @@ fn test_nearby_contact_exclusion() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
     rc.contacts.push(target.clone());
 
@@ -329,6 +334,7 @@ fn test_nearby_contact_exclusion() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
     rc.contacts.push(left_contact);
 
@@ -383,6 +389,7 @@ fn test_close_contact_infinite_loop_prevention() {
             Vec2::new(60.0, 10.0),
         ]),
         scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+        discovery_beam_width: 0.6,
     };
 
     let contacts = vec![contact];
@@ -575,6 +582,7 @@ fn test_jamming_mode() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
     rc.contacts.push(contact);
 
@@ -630,6 +638,7 @@ fn test_missile_priority_scanning_threshold() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
     rc.contacts.push(contact);
 
@@ -749,6 +758,7 @@ fn test_tracking_beam_exclusion() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
     rc.contacts.push(contact_target);
 
@@ -780,6 +790,7 @@ fn test_tracking_beam_exclusion() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
     rc.contacts.push(contact_other);
 
@@ -842,6 +853,7 @@ fn test_scan_boundary() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
 
     let slice = ScanSlice {
@@ -926,6 +938,7 @@ fn test_scan_boundary() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
 
     // Initialize scan boundary
@@ -1006,6 +1019,7 @@ fn test_expand_scan_boundary() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
 
     let slice = ScanSlice {
@@ -1077,6 +1091,7 @@ fn test_scan_cone_filtering_in_association() {
             own_pos + Vec2::new(1100.0, 220.0),
         ]),
         scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+        discovery_beam_width: 0.6,
     };
     rc.contacts.push(contact);
 
@@ -1151,6 +1166,7 @@ fn test_custom_tracking_frequency() {
         missile_scan_ticks_remaining: 0,
         scan_boundary_points: None,
         scan_boundary_vels: None,
+        discovery_beam_width: 0.6,
     };
 
     rc.priority_target_frequencies = vec![(101, 0.2)]; // 0.2s = 12 ticks
@@ -1233,6 +1249,7 @@ fn test_ambiguous_scan_prevention() {
             c1_pos + Vec2::new(10.0, 10.0),
         ]),
         scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+        discovery_beam_width: 0.6,
     };
 
     // Create contact 2 (distance ~2000m, same line of sight)
@@ -1269,6 +1286,7 @@ fn test_ambiguous_scan_prevention() {
             c2_pos + Vec2::new(10.0, 10.0),
         ]),
         scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+        discovery_beam_width: 0.6,
     };
 
     rc.contacts.push(contact1);
@@ -1293,5 +1311,74 @@ fn test_ambiguous_scan_prevention() {
     assert!(slice3.min_distance > 1990.0);
     assert_eq!(slice3.max_distance, 10000.0);
     assert_eq!(slice_gen.avoided_contact_id, None);
+}
+
+#[test]
+fn test_radar_tracking_bisection() {
+    let rc = RadarController::new();
+    let current_t = current_tick();
+
+    // Create a contact at (1000, 0) with a wide polygon relative to (0, 0)
+    let c_pos = Vec2::new(1000.0, 0.0);
+    let mut contact = Contact {
+        id: 1,
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            c_pos,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            current_t,
+        ),
+        last_measurement_tick: current_t,
+        pos_uncertainty: 10.0,
+        vel_uncertainty: 1.0,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(10.0, 1.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(10.0, 1.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: Some([
+            Vec2::new(1000.0, -100.0),
+            Vec2::new(1000.0, 100.0),
+            Vec2::new(1100.0, -100.0),
+            Vec2::new(1100.0, 100.0),
+        ]),
+        scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+        discovery_beam_width: 0.05, // very narrow target width to trigger bisection
+    };
+
+    // 1st attempt: centered (tracking_retry_count == 0)
+    let job0 = rc.generate_tracking_scan(&contact, current_t).expect("Job 0");
+    // original_width should be max_rel_angle - min_rel_angle.
+    // min_rel_angle = atan2(-100, 1000) = -0.099668
+    // max_rel_angle = atan2(100, 1000) = 0.099668
+    // original_width = 0.199337
+    // expected_width = 0.6 * original_width = 0.119602
+    assert!((job0.width - 0.119602).abs() < 1e-4, "Job 0 width was {}", job0.width);
+    assert!(job0.angle.abs() < 1e-4, "Job 0 angle was {}", job0.angle);
+
+    // 2nd attempt: left 60% (tracking_retry_count == 1)
+    contact.tracking_retry_count = 1;
+    let job1 = rc.generate_tracking_scan(&contact, current_t).expect("Job 1");
+    assert!((job1.width - 0.119602).abs() < 1e-4);
+    // expected angle: target_angle + max_rel_angle - 0.3 * original_width
+    // = 0.0 + 0.099668 - 0.3 * 0.199337 = 0.099668 - 0.059801 = 0.039867
+    assert!((job1.angle - 0.039867).abs() < 1e-4, "Job 1 angle was {}", job1.angle);
+
+    // 3rd attempt: right 60% (tracking_retry_count == 2)
+    contact.tracking_retry_count = 2;
+    let job2 = rc.generate_tracking_scan(&contact, current_t).expect("Job 2");
+    assert!((job2.width - 0.119602).abs() < 1e-4);
+    // expected angle: target_angle + min_rel_angle + 0.3 * original_width
+    // = 0.0 - 0.099668 + 0.3 * 0.199337 = -0.039867
+    assert!((job2.angle - (-0.039867)).abs() < 1e-4, "Job 2 angle was {}", job2.angle);
 }
 

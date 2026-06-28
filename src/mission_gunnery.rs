@@ -51,6 +51,10 @@ impl GunneryScanSliceGenerator {
 }
 
 impl ScanSliceGenerator for GunneryScanSliceGenerator {
+    fn search_width(&self) -> f64 {
+        std::f64::consts::TAU / 80.0
+    }
+
     fn next_slice(&mut self, _contacts: &[Contact]) -> ScanSlice {
         let current_t = current_tick();
         let mut hit = false;

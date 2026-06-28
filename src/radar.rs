@@ -109,6 +109,7 @@ pub struct Contact {
     pub missile_scan_ticks_remaining: u32,
     pub scan_boundary_points: Option<[Vec2; 4]>,
     pub scan_boundary_vels: Option<[Vec2; 4]>,
+    pub discovery_beam_width: f64,
 }
 
 impl std::ops::Deref for Contact {
@@ -588,6 +589,9 @@ pub trait ScanSliceGenerator {
     fn next_slice(&mut self, contacts: &[Contact]) -> ScanSlice;
     fn notify_hit(&mut self) {}
     fn notify_non_missile_contact(&mut self, _has: bool) {}
+    fn search_width(&self) -> f64 {
+        0.6
+    }
 }
 
 pub struct DefaultScanSliceGenerator {
@@ -909,6 +913,10 @@ impl ScanSliceGenerator for DefaultScanSliceGenerator {
         self.has_non_missile_contact = has;
     }
 
+    fn search_width(&self) -> f64 {
+        self.search_width
+    }
+
     fn next_slice(&mut self, contacts: &[Contact]) -> ScanSlice {
         loop {
             let mut slice = if let Some(avoided_id) = self.avoided_contact_id {
@@ -1151,6 +1159,7 @@ impl RadarController {
             let cov_y = Contact::initial_cov(pos_unc, vel_unc, c.class);
 
             let new_id = self.next_contact_id;
+            let discovery_beam_width = slice.map(|s| s.width).unwrap_or_else(|| self.slice_generator.search_width());
             self.contacts.push(Contact {
                 id: new_id,
                 kinematic: KinematicState::new(
@@ -1189,6 +1198,7 @@ impl RadarController {
                 },
                 scan_boundary_points: None,
                 scan_boundary_vels: None,
+                discovery_beam_width,
             });
             self.next_contact_id += 1;
             debug!("Discovered new contact {}", new_id);
@@ -1522,6 +1532,7 @@ impl RadarController {
                                 let cov_x = Contact::initial_cov(pos_unc, vel_unc, c.class);
                                 let cov_y = Contact::initial_cov(pos_unc, vel_unc, c.class);
 
+                                let discovery_beam_width = slice.map(|s| s.width).unwrap_or_else(|| self.slice_generator.search_width());
                                 self.contacts.push(Contact {
                                     id: self.next_contact_id,
                                     kinematic: KinematicState::new(
@@ -1561,6 +1572,7 @@ impl RadarController {
                                     },
                                     scan_boundary_points: None,
                                     scan_boundary_vels: None,
+                                    discovery_beam_width,
                                 });
                                 self.next_contact_id += 1;
                             }
@@ -2081,6 +2093,36 @@ impl RadarController {
 
             draw_text!(l_max, color, "{}", label);
         };
+
+        if let (Some((min_pt_dist, max_pt_dist)), Some((min_rel_angle, max_rel_angle))) =
+            (boundary_dist_limits, boundary_angle_limits)
+        {
+            let original_width = max_rel_angle - min_rel_angle;
+            if original_width > contact.discovery_beam_width {
+                let width = (0.6 * original_width).max(0.005);
+                let angle = match contact.tracking_retry_count {
+                    0 => target_angle,
+                    1 => normalize_angle(target_angle + max_rel_angle - 0.3 * original_width),
+                    2 => normalize_angle(target_angle + min_rel_angle + 0.3 * original_width),
+                    _ => target_angle,
+                };
+                let job = RadarJob {
+                    angle,
+                    width,
+                    min_distance: min_pt_dist,
+                    max_distance: max_pt_dist,
+                    state: RadarState::Tracking {
+                        contact_id: contact.id,
+                    },
+                };
+                draw_job_beam(
+                    &job,
+                    rgb(0, 255, 0),
+                    &format!("Selected: Bisected (cid {})", contact.id),
+                );
+                return Some(job);
+            }
+        }
 
         // Draw 99.9% CI circle
         let ci_999_radius = ci_multiplier(0.999) * next_pos_uncertainty;
