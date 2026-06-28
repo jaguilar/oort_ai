@@ -288,14 +288,14 @@ fn test_nearby_contact_exclusion() {
         .expect("Job should be generated");
     assert_eq!(job1.angle, 0.0);
     // By default target is at 1000m.
-    // Min distance = (1000.0 - 32.9) = 967.1. Max distance = 1000.0 + 32.9 = 1032.9.
+    // Min distance = (1000.0 - 28.1) = 971.9. Max distance = 1000.0 + 28.1 = 1028.1.
     assert!(
-        (job1.min_distance - 967.1).abs() < 0.1,
+        (job1.min_distance - 971.9).abs() < 0.1,
         "min_distance was {}",
         job1.min_distance
     );
     assert!(
-        (job1.max_distance - 1032.9).abs() < 0.1,
+        (job1.max_distance - 1028.1).abs() < 0.1,
         "max_distance was {}",
         job1.max_distance
     );
@@ -341,6 +341,54 @@ fn test_nearby_contact_exclusion() {
         "Beam should shift to the right, angle = {}",
         job2.angle
     );
+}
+
+#[test]
+fn test_close_contact_infinite_loop_prevention() {
+    let mut slice_gen = DefaultScanSliceGenerator::new(0.6, 10000.0);
+    // Setup target position tracking (biased sweep) centered at 50m
+    slice_gen.target_pos = Some(std::rc::Rc::new(std::cell::RefCell::new(Some(Vec2::new(50.0, 0.0)))));
+    slice_gen.biased_scan_width = 0.6;
+
+    // Create a contact at a very close distance (50m)
+    let contact = Contact {
+        id: 1,
+        kinematic: KinematicState::new(
+            Class::Fighter,
+            Vec2::new(50.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            0,
+        ),
+        last_measurement_tick: 0,
+        pos_uncertainty: 10.0,
+        vel_uncertainty: 5.0,
+        provisional: false,
+        tracking_retry_count: 0,
+        confirmation_attempts: 0,
+        unscanned_in_range_ticks: 0,
+        p_cov_x: Contact::initial_cov(10.0, 5.0, Class::Fighter),
+        p_cov_y: Contact::initial_cov(10.0, 5.0, Class::Fighter),
+        prioritize_scan: false,
+        prev_scan_pos_uncertainty: None,
+        low_improvement_consecutive_scans: 0,
+        last_beam_width: None,
+        last_beam_center: None,
+        last_beam_center_pos: None,
+        missile_scan_ticks_remaining: 0,
+        scan_boundary_points: Some([
+            Vec2::new(40.0, -10.0),
+            Vec2::new(40.0, 10.0),
+            Vec2::new(60.0, -10.0),
+            Vec2::new(60.0, 10.0),
+        ]),
+        scan_boundary_vels: Some([Vec2::new(0.0, 0.0); 4]),
+    };
+
+    let contacts = vec![contact];
+    // This call should not loop infinitely, and should return a valid ScanSlice.
+    let slice = slice_gen.next_slice(&contacts);
+    assert_eq!(slice.max_distance, 10000.0);
 }
 
 #[test]
