@@ -316,71 +316,6 @@ impl Contact {
 
         self.scan_boundary_points = Some([c1, c2, c3, c4]);
         self.scan_boundary_vels = Some([v1, v2, v3, v4]);
-
-        // // 1. Draw uncertainty circle at the time of scan
-        // draw_polygon(
-        //     est_pos,
-        //     ci_radius,
-        //     32,
-        //     0.0,
-        //     rgb(255, 255, 0), // Yellow color for the scan-time uncertainty circle
-        // );
-        // draw_text!(
-        //     est_pos + vec2(0.0, -ci_radius - 15.0),
-        //     rgb(255, 255, 0),
-        //     "CI (cid {})",
-        //     self.id
-        // );
-
-        // // 2. Draw tangent lines from own ship to the uncertainty circle at the time of scan
-        // let d_sq = dist * dist - ci_radius * ci_radius;
-        // let d_tangent = if d_sq > 0.0 { d_sq.sqrt() } else { dist };
-
-        // let tang_l_dir = vec2((alpha + phi).cos(), (alpha + phi).sin());
-        // let tang_r_dir = vec2((alpha - phi).cos(), (alpha - phi).sin());
-
-        // let tang_l = own_pos + tang_l_dir * d_tangent;
-        // let tang_r = own_pos + tang_r_dir * d_tangent;
-
-        // draw_line(own_pos, tang_l, rgb(255, 128, 0)); // Orange for tangents
-        // draw_line(own_pos, tang_r, rgb(255, 128, 0));
-
-        // draw_text!(tang_l, rgb(255, 128, 0), "tang_L");
-        // draw_text!(tang_r, rgb(255, 128, 0), "tang_R");
-
-        // // 3. Draw the radar slice (beam cone) that got the hit
-        // let slice_l_dir = vec2(
-        //     (slice.angle + slice.width / 2.0).cos(),
-        //     (slice.angle + slice.width / 2.0).sin(),
-        // );
-        // let slice_r_dir = vec2(
-        //     (slice.angle - slice.width / 2.0).cos(),
-        //     (slice.angle - slice.width / 2.0).sin(),
-        // );
-
-        // let slice_l_min = own_pos + slice_l_dir * slice.min_distance;
-        // let slice_l_max = own_pos + slice_l_dir * slice.max_distance;
-        // let slice_r_min = own_pos + slice_r_dir * slice.min_distance;
-        // let slice_r_max = own_pos + slice_r_dir * slice.max_distance;
-
-        // // Draw slice border lines in green
-        // draw_line(slice_l_min, slice_l_max, rgb(0, 180, 0));
-        // draw_line(slice_r_min, slice_r_max, rgb(0, 180, 0));
-        // draw_line(slice_l_min, slice_r_min, rgb(0, 180, 0));
-        // draw_line(slice_l_max, slice_r_max, rgb(0, 180, 0));
-
-        // draw_text!(slice_l_max, rgb(0, 180, 0), "slice_L");
-        // draw_text!(slice_r_max, rgb(0, 180, 0), "slice_R");
-
-        // // 4. Draw the original computed boundary box (before prediction)
-        // // Draw computed boundary box in pink/magenta
-        // draw_line(c1, c2, rgb(255, 0, 255));
-        // draw_line(c3, c4, rgb(255, 0, 255));
-        // draw_line(c1, c3, rgb(255, 0, 255));
-        // draw_line(c2, c4, rgb(255, 0, 255));
-
-        // draw_text!(c2, rgb(255, 0, 255), "calc_L");
-        // draw_text!(c4, rgb(255, 0, 255), "calc_R");
     }
 
     pub fn predict_scan_boundary(&mut self, dt: f64) {
@@ -1159,7 +1094,9 @@ impl RadarController {
             let cov_y = Contact::initial_cov(pos_unc, vel_unc, c.class);
 
             let new_id = self.next_contact_id;
-            let discovery_beam_width = slice.map(|s| s.width).unwrap_or_else(|| self.slice_generator.search_width());
+            let discovery_beam_width = slice
+                .map(|s| s.width)
+                .unwrap_or_else(|| self.slice_generator.search_width());
             self.contacts.push(Contact {
                 id: new_id,
                 kinematic: KinematicState::new(
@@ -1532,7 +1469,9 @@ impl RadarController {
                                 let cov_x = Contact::initial_cov(pos_unc, vel_unc, c.class);
                                 let cov_y = Contact::initial_cov(pos_unc, vel_unc, c.class);
 
-                                let discovery_beam_width = slice.map(|s| s.width).unwrap_or_else(|| self.slice_generator.search_width());
+                                let discovery_beam_width = slice
+                                    .map(|s| s.width)
+                                    .unwrap_or_else(|| self.slice_generator.search_width());
                                 self.contacts.push(Contact {
                                     id: self.next_contact_id,
                                     kinematic: KinematicState::new(
@@ -1765,9 +1704,7 @@ impl RadarController {
                 );
                 draw_polygon(contact.current_position(), radius, 16, 0.0, color);
             };
-            // draw_ci(0.995);
-            // draw_ci(0.99);
-            // draw_ci(0.95);
+            draw_ci(0.95);
 
             let text_pos = contact.current_position() + vec2(0.0, radius + 20.0);
             draw_text!(text_pos, rgb(255, 165, 0), "cid: {}", contact.id);
